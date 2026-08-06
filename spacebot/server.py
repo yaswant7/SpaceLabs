@@ -1,422 +1,492 @@
-"""Spacebot POC web server — pure stdlib, no framework.
+"""Spacebot web server — pure stdlib, no framework.
 
-  python3 seed.py && python3 server.py     # http://localhost:8080
+    python3 seed.py && python3 server.py      # http://localhost:8080
 
-Login-based, two experiences:
+Three experiences behind one login:
   - End user  -> a clean "ask me anything" chat. Never sees the workflow catalog.
-  - Author    -> Studio: add knowledge, catalog, and the demand-ranked gaps.
-  - Admin     -> also Model settings (bring your own Claude / OpenAI / local key).
+  - Author    -> Knowledge Studio: add knowledge, catalog, and the demand-ranked gaps.
+  - Admin     -> also Model settings (local Ollama, or bring your own hosted key).
 
-The end user's answer is the model's freshly-worded, simple explanation of what RAG
-retrieved — not a dump of the stored text.
+This file is deliberately thin. It owns HTTP concerns only — routing, auth, serialisation,
+SSE framing — and delegates everything else: retrieval and answering to sb.rag, model
+choice to sb.providers, storage to sb.db, and the entire UI to sb/web/. Adding an
+endpoint is one entry in ROUTES; changing the UI never touches Python.
 """
+import errno
 import json
+import mimetypes
+import os
 import re
-import time
+import subprocess
+from functools import wraps
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from sb import auth, db, ingest, settings
+from sb import auth, chunks, config, db, ingest, settings
 from sb.media import blob as mblob
 from sb.media import pipeline as mpipe
-from sb.pipeline import ask, ask_stream
-from sb.providers import get_provider
+from sb.rag import answer, answer_stream
 
-PORT = 8080
+PORT = int(os.environ.get("SPACEBOT_PORT", "8080"))
+WEB_DIR = os.path.join(config.BASE_DIR, "web")
 
-CSS = """
-:root{--bg:#0b1020;--panel:#111a30;--card:#151e37;--line:#26314f;--txt:#e9eefb;--mut:#93a3c8;
---acc:#6ea8ff;--acc2:#8f7dff;--ok:#3ecf8e;--warn:#ffcc66;--bad:#ff6b81}
-*{box-sizing:border-box}html,body{height:100%}
-body{margin:0;font:15px/1.55 system-ui,Segoe UI,Roboto,sans-serif;background:
-radial-gradient(1200px 600px at 70% -10%,#16224a 0,transparent 60%),var(--bg);color:var(--txt)}
-a{color:var(--acc);text-decoration:none}
-.top{display:flex;align-items:center;gap:20px;padding:12px 22px;border-bottom:1px solid var(--line);
-position:sticky;top:0;background:rgba(11,16,32,.85);backdrop-filter:blur(8px);z-index:5}
-.top .logo{font-weight:800;letter-spacing:.5px}.top nav a{color:var(--mut);margin-right:16px;font-weight:600}
-.top nav a.on{color:var(--txt)}.top .right{margin-left:auto;color:var(--mut);font-size:13px;display:flex;gap:14px;align-items:center}
-.pill{background:var(--card);border:1px solid var(--line);border-radius:999px;padding:5px 12px}
-input,textarea,select{width:100%;background:#0d1428;border:1px solid var(--line);color:var(--txt);
-border-radius:12px;padding:12px;font:inherit}textarea{min-height:130px;resize:vertical}
-button{background:linear-gradient(180deg,var(--acc),#4d8ef0);color:#04122e;border:0;border-radius:12px;
-padding:11px 18px;font-weight:700;cursor:pointer}button.ghost{background:transparent;border:1px solid var(--line);color:var(--txt);font-weight:600}
-button.mini{padding:6px 12px;font-size:13px;border-radius:999px}
-h2{font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.7px;margin:.2em 0 .7em}
-.muted{color:var(--mut)}.small{font-size:13px}
-.badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:700}
-.b-high{background:rgba(62,207,142,.16);color:var(--ok)}.b-medium{background:rgba(255,204,102,.16);color:var(--warn)}
-.b-low{background:rgba(255,107,129,.16);color:var(--bad)}
-"""
-
-LOGIN_HTML = """<!doctype html><meta charset=utf-8><title>Spacebot · sign in</title>
-<meta name=viewport content="width=device-width,initial-scale=1"><style>""" + CSS + """
-.box{max-width:380px;margin:12vh auto;padding:0 20px}.card{background:var(--card);border:1px solid var(--line);
-border-radius:18px;padding:26px}.logo{font-size:26px;font-weight:800;text-align:center;margin-bottom:4px}
-.row{margin-top:12px}.err{color:var(--bad);font-size:13px;margin-top:10px;min-height:16px}
-.hint{margin-top:16px;font-size:12.5px;color:var(--mut);line-height:1.7}</style>
-<div class=box><div class=logo>🛰 Spacebot</div>
-<p class="muted small" style="text-align:center;margin-top:0">Your team's onboarding brain</p>
-<div class=card>
-  <div class=row><input id=email placeholder="email" autofocus></div>
-  <div class=row><input id=pw type=password placeholder="password"></div>
-  <div class=row><button style="width:100%" onclick=go()>Sign in</button></div>
-  <div class=err id=err></div>
-  <div class=hint>Demo logins:<br>👤 end user — <b>raj@spacelabs.dev</b> / raj123<br>
-  ✍ author — <b>sarah@spacelabs.dev</b> / sarah123<br>🛠 admin — <b>admin@spacelabs.dev</b> / admin123</div>
-</div></div>
-<script>
-const $=s=>document.querySelector(s);
-$('#pw').addEventListener('keydown',e=>{if(e.key==='Enter')go()});
-async function go(){
-  $('#err').textContent='';
-  const r=await fetch('/api/login',{method:'POST',headers:{'content-type':'application/json'},
-    body:JSON.stringify({email:$('#email').value.trim(),password:$('#pw').value})});
-  const d=await r.json();
-  if(d.ok)location.href='/'; else $('#err').textContent=d.error||'Sign in failed';
-}
-</script>"""
-
-APP_HTML = """<!doctype html><meta charset=utf-8><title>Spacebot</title>
-<meta name=viewport content="width=device-width,initial-scale=1"><style>""" + CSS + """
-.stage{max-width:860px;margin:0 auto;padding:0 18px;height:calc(100vh - 56px);display:flex;flex-direction:column}
-/* chat — Claude-like */
-.thread{flex:1;overflow-y:auto;padding:24px 0 8px;scroll-behavior:smooth}
-.thread::-webkit-scrollbar{width:10px}.thread::-webkit-scrollbar-thumb{background:#22314f;border-radius:8px}
-.hello{margin:13vh auto;text-align:center;max-width:560px}
-.hello h1{font-size:30px;margin:0 0 8px;letter-spacing:-.5px}
-.chip{display:inline-block;background:var(--card);border:1px solid var(--line);border-radius:12px;
-padding:9px 14px;margin:6px 5px 0;font-size:14px;cursor:pointer;transition:.15s}
-.chip:hover{border-color:var(--acc);transform:translateY(-1px)}
-.turn{display:flex;gap:14px;padding:12px 0;animation:rise .22s ease}
-@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-.turn.me{justify-content:flex-end}
-.turn .av{width:30px;height:30px;border-radius:9px;flex:none;display:flex;align-items:center;
-justify-content:center;font-size:15px;background:linear-gradient(180deg,var(--acc2),var(--acc));color:#04122e}
-.turn.me .content{max-width:78%;background:#1a2647;border:1px solid #274069;
-border-radius:16px 16px 5px 16px;padding:11px 15px;white-space:pre-wrap}
-.turn.bot .content{flex:1;padding-top:4px;line-height:1.72;font-size:15.3px}
-.bot .content p{margin:.5em 0}.bot .content p.vok{color:var(--ok);font-size:14px;margin:.25em 0}
-.bot .content h3{font-size:16px;margin:.7em 0 .3em}
-.bot .content ol,.bot .content ul{margin:.4em 0;padding-left:1.35em}.bot .content li{margin:.3em 0}
-.bot .content code{background:#0b1430;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font:13px ui-monospace,monospace}
-.bot .content pre{background:#0b1430;border:1px solid var(--line);border-radius:10px;padding:12px 14px;overflow:auto;margin:.6em 0}
-.bot .content pre code{background:none;border:0;padding:0}
-.cursor{display:inline-block;width:7px;height:15px;background:var(--acc);margin-left:2px;border-radius:2px;
-animation:blink 1s steps(2) infinite;vertical-align:-2px}
-@keyframes blink{50%{opacity:0}}
-.kbox{background:rgba(255,204,102,.1);border:1px solid rgba(255,204,102,.28);border-radius:12px;padding:10px 13px;margin:10px 0}
-.src{margin-top:14px;padding-top:10px;border-top:1px solid var(--line);color:var(--mut);font-size:12.5px;
-display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-.acts{margin-top:10px;display:flex;gap:8px;flex-wrap:wrap}
-.acts .mini{background:transparent;border:1px solid var(--line);color:var(--mut)}
-.acts .mini:hover{color:var(--txt);border-color:var(--acc)}
-.composer{padding:8px 0 18px}
-.cbar{display:flex;gap:8px;align-items:flex-end;background:#0d1428;border:1px solid var(--line);
-border-radius:18px;padding:8px 8px 8px 16px;box-shadow:0 6px 26px rgba(0,0,0,.28)}
-.cbar textarea{border:0;background:transparent;padding:8px 0;resize:none;max-height:180px;line-height:1.5}
-.cbar textarea:focus{outline:none}.sendbtn{border-radius:13px;padding:10px 16px;flex:none}
-.hintline{text-align:center;color:var(--mut);font-size:11.5px;margin-top:8px}
-/* author views */
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:22px 0}@media(max-width:760px){.grid{grid-template-columns:1fr}}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
-.tabs{display:flex;gap:8px;padding:18px 0 0}.tabs button{background:transparent;border:1px solid var(--line);color:var(--mut)}
-.tabs button.on{background:var(--card);color:var(--txt)}
-.wf{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:8px 0}.k{font-family:ui-monospace,monospace;font-size:12px;color:var(--acc)}
-.row{margin-top:10px}.gap{border-left:2px solid var(--warn);padding:6px 0 6px 12px;margin:10px 0}
-.drop{border:1.5px dashed var(--line);border-radius:12px;padding:24px;text-align:center;color:var(--mut);margin-top:10px;transition:.15s}
-.drop.over{border-color:var(--acc);background:rgba(110,168,255,.06)}.link{color:var(--acc);cursor:pointer}
-.foot{margin-top:14px;padding-top:10px;border-top:1px solid var(--line);color:var(--mut);font-size:12.5px}
-</style>
-<div class=top><span class=logo>🛰 SPACEBOT</span><nav id=nav></nav>
-<div class=right><span id=who></span><span class="pill" id=prov></span><a href=/logout>Sign out</a></div></div>
-<div id=root></div>
-<script>
-const $=(s,r=document)=>r.querySelector(s);
-const esc=s=>(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-const jget=async u=>(await fetch(u)).json();
-const jpost=async(u,b)=>(await fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)})).json();
-let ME={};
-
-async function boot(){
-  ME=await jget('/api/me');
-  $('#who').textContent=ME.name;
-  const author=ME.role==='author'||ME.role==='admin';
-  $('#prov').textContent=author?('model: '+ME.provider):'';
-  let nav='<a href=/ id=n-chat>Chat</a>';
-  if(author)nav+='<a href=/studio id=n-studio>Studio</a>';
-  if(ME.role==='admin')nav+='<a href=/admin id=n-admin>Settings</a>';
-  $('#nav').innerHTML=nav;
-  let path=location.pathname;
-  if(!author&&(path==='/studio'||path==='/admin')){location.href='/';return;}
-  if(path==='/studio')studio();else if(path==='/admin')admin();else chat();
-  const cur=path==='/studio'?'studio':path==='/admin'?'admin':'chat';
-  const a=$('#n-'+cur);if(a)a.className='on';
-}
-
-/* ---------------- CHAT (streaming, Claude-like) ---------------- */
-let streaming=null,stick=true;
-function chat(){
-  $('#root').innerHTML=`<div class=stage>
-    <div class=thread id=thread></div>
-    <div class=composer>
-      <div class=cbar>
-        <textarea id=q rows=1 placeholder="Ask me anything…"></textarea>
-        <button class=sendbtn id=sbtn onclick=onSend()>Send</button>
-      </div>
-      <div class=hintline>Spacebot answers only from what your team has documented · Enter to send · Shift+Enter for a new line</div>
-    </div></div>`;
-  greeting();
-  const q=$('#q');q.focus();
-  q.addEventListener('input',()=>{q.style.height='auto';q.style.height=Math.min(q.scrollHeight,180)+'px';});
-  q.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();onSend();}});
-  const t=$('#thread');t.addEventListener('scroll',()=>{stick=(t.scrollHeight-t.scrollTop-t.clientHeight)<90;});
-}
-function greeting(){
-  const first=(ME.name||'there').split(' ')[0];
-  $('#thread').innerHTML=`<div class=hello><h1>Hi ${esc(first)} 👋</h1>
-   <p class=muted>Ask me anything about working here — I'll walk you through it, step by step.</p>
-   <div>${['How do I roll back a production deploy?','What do I do in my first week?','How do I create a purchase order?']
-     .map(s=>`<span class=chip onclick="ex(this.textContent)">${s}</span>`).join('')}</div></div>`;
-}
-window.ex=t=>{$('#q').value=t;onSend();};
-function turn(who){
-  if($('#thread .hello'))$('#thread').innerHTML='';
-  const d=document.createElement('div');d.className='turn '+who;
-  d.innerHTML=(who==='bot'?'<div class=av>🛰</div>':'')+'<div class=content></div>';
-  $('#thread').appendChild(d);stick=true;scrollDown();
-  return $('.content',d);
-}
-function scrollDown(){const t=$('#thread');if(stick&&t)t.scrollTop=t.scrollHeight;}
-function setStreaming(on){const b=$('#sbtn');if(b){b.textContent=on?'Stop':'Send';b.onclick=on?stopStream:onSend;}}
-function stopStream(){if(streaming){streaming.abort();streaming=null;}setStreaming(false);}
-function onSend(){
-  if(streaming)return;
-  const qEl=$('#q');const q=qEl.value.trim();if(!q)return;
-  qEl.value='';qEl.style.height='auto';
-  turn('me').textContent=q;
-  askStream(q,'');
-}
-window.simpler=q=>{if(streaming)return;askStream(q,'Explain even more simply and briefly, as if to someone with zero background. Use different, plainer wording.');};
-async function askStream(q,style){
-  const content=turn('bot');content.innerHTML='<span class=cursor></span>';
-  let md='',meta=null;
-  streaming=new AbortController();setStreaming(true);
-  try{
-    const resp=await fetch('/api/ask/stream',{method:'POST',headers:{'content-type':'application/json'},
-      body:JSON.stringify({question:q,style}),signal:streaming.signal});
-    const reader=resp.body.getReader(),dec=new TextDecoder();let buf='';
-    for(;;){
-      const {value,done}=await reader.read();if(done)break;
-      buf+=dec.decode(value,{stream:true});let idx;
-      while((idx=buf.indexOf('\\n\\n'))>=0){
-        const ev=parseSSE(buf.slice(0,idx));buf=buf.slice(idx+2);
-        if(!ev)continue;
-        if(ev.event==='delta'){md+=ev.data;content.innerHTML=mdToHtml(md)+' <span class=cursor></span>';scrollDown();}
-        else if(ev.event==='status'){if(!md){content.innerHTML='<span class=muted>'+esc(ev.data)+'</span> <span class=cursor></span>';scrollDown();}}
-        else if(ev.event==='meta')meta=ev.data;
-      }
-    }
-    content.innerHTML=mdToHtml(md)+renderMeta(meta);
-    const sb=content.querySelector('.js-simpler');if(sb)sb.onclick=()=>simpler(q);
-    scrollDown();
-  }catch(err){
-    if(err.name==='AbortError')content.innerHTML=mdToHtml(md)+' <span class=muted>(stopped)</span>';
-    else content.innerHTML='<span class=muted>Something went wrong — try again.</span>';
-  }finally{streaming=null;setStreaming(false);}
-}
-function parseSSE(raw){
-  let event='message',data='';
-  for(const line of raw.split('\\n')){
-    if(line.startsWith('event:'))event=line.slice(6).trim();
-    else if(line.startsWith('data:'))data+=line.slice(5).replace(/^ /,'');
-  }
-  if(!data)return null;try{return {event,data:JSON.parse(data)};}catch(e){return null;}
-}
-function renderMeta(m){
-  if(!m)return '';
-  if(m.abstained)return `<div class=src>📌 I don't have this documented yet — I've flagged it so a senior can add it. You'll be covered next time.</div>`;
-  const w=m.workflow||{};
-  let h=`<div class=src><span class="badge b-${m.band}">${m.band}</span>📎 Based on <b>${esc(w.name||'')}</b>${w.verified_by?` · verified by @${esc(w.verified_by)}`:''}</div>`;
-  if(m.alternatives&&m.alternatives.length)h+=`<div style="margin-top:8px">${m.alternatives.map(x=>`<span class=chip onclick="ex('How do I ${esc((x.name||'').toLowerCase())}?')">${esc(x.name)} →</span>`).join('')}</div>`;
-  h+=`<div class=acts><button class="mini js-simpler">↻ Explain simpler</button>
-    <button class=mini onclick="copyMsg(this)">Copy</button>
-    <button class=mini onclick="this.textContent='👍'">👍</button>
-    <button class=mini onclick="this.textContent='👎'">👎</button></div>`;
-  return h;
-}
-window.copyMsg=b=>{const c=b.closest('.content').cloneNode(true);
-  const s=c.querySelector('.src');if(s)s.remove();const a=c.querySelector('.acts');if(a)a.remove();
-  if(navigator.clipboard)navigator.clipboard.writeText(c.innerText.trim());b.textContent='Copied';};
-/* tiny markdown -> html (streamed text re-rendered each delta) */
-function mdToHtml(md){
-  const fences=[];
-  md=md.replace(/```(\\w*)\\n?([\\s\\S]*?)```/g,(m,l,c)=>{fences.push(c);return '@@FENCE'+(fences.length-1)+'@@';});
-  const lines=md.split('\\n');let out=[],i=0;
-  while(i<lines.length){
-    const ln=lines[i];
-    if(/^\\s*\\d+\\.\\s+/.test(ln)){const it=[];while(i<lines.length&&/^\\s*\\d+\\.\\s+/.test(lines[i])){it.push(lines[i].replace(/^\\s*\\d+\\.\\s+/,''));i++;}out.push('<ol>'+it.map(x=>'<li>'+inline(x)+'</li>').join('')+'</ol>');continue;}
-    if(/^\\s*[-*]\\s+/.test(ln)){const it=[];while(i<lines.length&&/^\\s*[-*]\\s+/.test(lines[i])){it.push(lines[i].replace(/^\\s*[-*]\\s+/,''));i++;}out.push('<ul>'+it.map(x=>'<li>'+inline(x)+'</li>').join('')+'</ul>');continue;}
-    if(/^\\s*#{1,3}\\s+/.test(ln)){out.push('<h3>'+inline(ln.replace(/^\\s*#{1,3}\\s+/,''))+'</h3>');i++;continue;}
-    if(ln.trim()===''){i++;continue;}
-    const para=[ln];i++;
-    while(i<lines.length&&lines[i].trim()!==''&&!/^\\s*(\\d+\\.|[-*]|#{1,3})\\s+/.test(lines[i])){para.push(lines[i]);i++;}
-    const text=para.join(' ');const cls=text.trim().indexOf('✓')===0?' class=vok':'';
-    out.push('<p'+cls+'>'+inline(text)+'</p>');
-  }
-  return out.join('').replace(/@@FENCE(\\d+)@@/g,(m,n)=>'<pre><code>'+esc(fences[+n])+'</code></pre>');
-}
-function inline(s){
-  s=esc(s);
-  s=s.replace(/`([^`]+)`/g,'<code>$1</code>');
-  s=s.replace(/\\*\\*([^*]+)\\*\\*/g,'<b>$1</b>');
-  s=s.replace(/\\*([^*]+)\\*/g,'<i>$1</i>');
-  return s;
-}
-
-/* ---------------- STUDIO (author) ---------------- */
-function studio(){
-  $('#root').innerHTML=`<div class=stage style="height:auto;overflow:auto">
-    <div class=tabs><button class=on id=t-add onclick="stab('add')">Add knowledge</button>
-      <button id=t-cat onclick="stab('cat')">Catalog</button>
-      <button id=t-gap onclick="stab('gap')">Knowledge gaps</button></div>
-    <div id=sview></div></div>`;
-  stab('add');
-}
-window.stab=t=>{
-  ['add','cat','gap'].forEach(x=>{const b=$('#t-'+x);if(b)b.className=x===t?'on':''});
-  if(t==='add')return addView();if(t==='cat')return catView();return gapView();
-};
-let picked=[];
-function addView(){
-  $('#sview').innerHTML=`<div class=card style="margin-top:16px"><h2>Add knowledge → workflow</h2>
-   <p class="muted small">Drop a PDF, one screenshot, a <b>sequence</b> of screenshots, a video, or a transcript —
-     any mix. Spacebot decomposes them all into ordered steps through the same pipeline.</p>
-   <div class=grid style="padding:0"><input id=wk placeholder="Workflow ID e.g. DEPLOY.CANARY"><input id=wn placeholder="Name"></div>
-   <div class=grid style="padding:8px 0"><input id=wc placeholder="Category"><input id=wo placeholder="Owner (you)"></div>
-   <div id=drop class=drop>Drag files here, or <label class=link>browse<input id=fin type=file multiple style="display:none"></label>
-     <div id=flist class="muted small" style="margin-top:8px"></div></div>
-   <textarea id=wt placeholder="…or paste a transcript / notes (optional)" style="margin-top:10px"></textarea>
-   <div class=row><button onclick=ingest()>Ingest & build draft</button></div>
-   <div id=iout class=row></div></div>`;
-  picked=[];
-  const fin=$('#fin'),drop=$('#drop');
-  fin.addEventListener('change',()=>showFiles(fin.files));
-  drop.addEventListener('dragover',e=>{e.preventDefault();drop.classList.add('over');});
-  drop.addEventListener('dragleave',()=>drop.classList.remove('over'));
-  drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('over');showFiles(e.dataTransfer.files);});
-}
-function showFiles(fl){picked=[...fl];$('#flist').innerHTML=picked.map(f=>`📎 ${esc(f.name)} <span class=muted>(${Math.round(f.size/1024)} KB)</span>`).join('<br>');}
-async function ingest(){
-  const wk=$('#wk').value.trim();
-  if(!wk){$('#iout').innerHTML='<span class="badge b-low">Workflow ID required</span>';return;}
-  if(!picked.length&&!$('#wt').value.trim()){$('#iout').innerHTML='<span class="badge b-low">Add a file or paste text</span>';return;}
-  const fd=new FormData();
-  fd.append('wf_key',wk);fd.append('name',$('#wn').value);fd.append('category',$('#wc').value);
-  fd.append('owner',$('#wo').value);fd.append('text',$('#wt').value);
-  picked.forEach(f=>fd.append('file',f,f.name));
-  $('#iout').innerHTML='<span class=muted>uploading…</span>';
-  const r=await fetch('/api/ingest',{method:'POST',body:fd}).then(x=>x.json());
-  if(r.error){$('#iout').innerHTML=`<span class="badge b-low">${esc(r.error)}</span>`;return;}
-  pollJob(r.job_id);
-}
-async function pollJob(id){
-  const j=await jget('/api/jobs/'+id);
-  if(!j||!j.status){$('#iout').innerHTML='<span class="badge b-low">job lost</span>';return;}
-  if(j.status==='drafted'){
-    const r=j.result||{};
-    $('#iout').innerHTML=`<div class=foot>
-      <span class="badge b-high">✓ draft ready</span> ${esc(r.name||r.wf_key)} — <b>${r.step_count}</b> steps from
-      <b>${r.segment_count}</b> segments · ${r.images_attached} image(s) attached
-      ${r.secrets_flagged?`· <span style="color:var(--warn)">⚠ ${r.secrets_flagged} secret(s) flagged</span>`:''}
-      ${r.uncertain&&r.uncertain.length?'<br>⚠ confirm: '+r.uncertain.map(esc).join('; '):''}
-      ${r.notes&&r.notes.length?'<br>⏳ awaiting capability: '+r.notes.map(esc).join('; '):''}
-      <br><span class=muted>status: in_review — not answerable in chat until you publish.</span>
-      <div class=row><button onclick="pubDraft('${esc(r.wf_key)}')">Publish</button>
-        <button class=ghost onclick="stab('cat')">View catalog</button></div></div>`;
-    return;
-  }
-  if(j.status==='failed'){$('#iout').innerHTML=`<span class="badge b-low">failed: ${esc(j.error||j.stage)}</span>`;return;}
-  $('#iout').innerHTML=`<span class=muted>⏳ ${esc(j.stage||j.status)}…</span>`;
-  setTimeout(()=>pollJob(id),700);
-}
-async function pubDraft(wk){await jpost('/api/workflows/'+wk+'/publish',{});
-  $('#iout').innerHTML=`<span class="badge b-high">✓ published — now answerable in chat</span>`;}
-async function catView(){
-  const c=await jget('/api/catalog');
-  $('#sview').innerHTML='<div class="card" style="margin-top:16px"><h2>'+c.length+' workflows</h2>'+
-    c.map(w=>`<div class=wf><b>${esc(w.name)}</b> <span class=k>${esc(w.wf_key)}</span>
-      ${w.status&&w.status!=='published'?`<span class="badge b-medium">${esc(w.status)}</span> <button class=mini onclick="pubCat('${esc(w.wf_key)}')">Publish</button>`:'<span class="badge b-high">published</span>'}<br>
-      <span class=muted>${esc(w.category)} · @${esc(w.owner)} · ${w.step_count} steps · ${w.asset_count} assets</span></div>`).join('')+'</div>';
-}
-window.pubCat=async wk=>{await jpost('/api/workflows/'+wk+'/publish',{});catView();};
-async function gapView(){
-  const g=await jget('/api/gaps');
-  $('#sview').innerHTML='<div class="card" style="margin-top:16px"><h2>What people asked that we couldn\\'t answer</h2>'+
-    '<p class="muted small">Each is a chance to add a workflow. Ranked by most recent.</p>'+
-    (g.length?g.map(x=>`<div class=gap>“${esc(x.question)}” <span class="muted small">· ${x.status}</span></div>`).join('')
-      :'<p class=muted>No gaps yet — ask something unknown in chat to see one appear.</p>')+'</div>';
-}
-
-/* ---------------- ADMIN (settings) ---------------- */
-async function admin(){
-  const s=await jget('/api/settings');
-  $('#root').innerHTML=`<div class=stage style="height:auto"><div class="card" style="margin-top:22px">
-   <h2>Model provider</h2>
-   <p class="muted small">Local-first. Point Spacebot at your own Ollama, or a hosted model.
-     Only this changes — the whole pipeline stays the same.</p>
-   <div class=row><select id=p>
-     <option value=ollama>Ollama (local)</option>
-     <option value=anthropic>Anthropic (Claude)</option>
-     <option value=openai>OpenAI / compatible</option>
-     <option value=mock>mock (offline heuristic)</option>
-     <option value=auto>auto</option></select></div>
-   <div class=row><input id=obase placeholder="Ollama base URL (default http://localhost:11434/v1)"></div>
-   <div class=row><input id=model placeholder="Model, e.g. llama3.1  ·  qwen2.5  ·  mistral"></div>
-   <div class=row><input id=ak placeholder="Anthropic API key (only if using Claude)"></div>
-   <div class=row><input id=ok placeholder="OpenAI API key (only if using OpenAI)"></div>
-   <div class=row><button onclick=saveAdmin()>Save</button>
-     <button class=ghost onclick=testModel()>Test connection</button></div>
-   <div class="src" style="margin-top:14px">resolving to <b>${esc(s.resolved_provider)}</b>
-     · model <b>${esc(s.compose_model||'—')}</b> · ollama ${esc(s.ollama_base_url||'')}
-     · claude ${esc(s.anthropic_api_key_masked||'—')} · openai ${esc(s.openai_api_key_masked||'—')}</div>
-   <div id=aout class=row></div></div></div>`;
-  $('#p').value=s.llm_provider||'ollama';$('#obase').value=s.ollama_base_url||'';$('#model').value=s.compose_model||'';
-}
-async function saveAdmin(){
-  const model=$('#model').value.trim();
-  const b={llm_provider:$('#p').value,ollama_base_url:$('#obase').value.trim(),
-    anthropic_api_key:$('#ak').value.trim(),openai_api_key:$('#ok').value.trim()};
-  if(model){b.route_model=model;b.compose_model=model;}
-  const r=await jpost('/api/settings',b);
-  $('#aout').innerHTML=`<span class="badge b-high">✓ saved — resolving to ${esc(r.resolved_provider)}</span>`;
-  $('#prov').textContent='model: '+r.resolved_provider;
-}
-async function testModel(){
-  $('#aout').innerHTML='<span class=muted>testing…</span>';
-  const h=await jget('/api/model/health');
-  if(h.ok&&h.reachable){
-    $('#aout').innerHTML=`<span class="badge b-high">✓ reachable at ${esc(h.base)}</span>
-      <div class="muted small" style="margin-top:6px">models: ${(h.models||[]).map(esc).join(', ')||'(none pulled yet)'}</div>
-      ${h.model_ready?'<div class="small" style="color:var(--ok);margin-top:4px">✓ '+esc(h.compose_model)+' is ready</div>'
-        :'<div class="small" style="color:var(--warn);margin-top:4px">⚠ '+esc(h.compose_model)+' not pulled — run: <b>ollama pull '+esc((h.compose_model||'').split(":")[0])+'</b></div>'}`;
-  } else if(h.ok){$('#aout').innerHTML=`<span class="badge b-high">✓ ${esc(h.provider||'ok')}</span>`;}
-  else {$('#aout').innerHTML=`<span class="badge b-low">✗ unreachable at ${esc(h.base||'')}</span>
-    <div class="muted small" style="margin-top:6px">${esc(h.error||'')}<br>${esc(h.hint||'')}</div>`;}
-}
-boot();
-</script>"""
+# Blob keys are sha256 hex + optional short extension. Anything else is not a key we
+# wrote, and must never reach the filesystem — this is the path-traversal gate.
+BLOB_KEY = re.compile(r"^[a-f0-9]{64}(\.[A-Za-z0-9]{1,8})?$")
 
 
-CTYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp",
-          "gif": "image/gif", "pdf": "application/pdf"}
+class HttpError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
+# ---------------------------------------------------------------- routing --
+ROUTES = []
+
+
+def route(method, pattern):
+    """Register a handler. `pattern` is a regex; named groups become handler kwargs."""
+    def deco(fn):
+        ROUTES.append((method, re.compile("^" + pattern + "$"), fn))
+        return fn
+    return deco
+
+
+def needs(level="user"):
+    """Auth gate. Handlers declare what they need; nothing else checks roles."""
+    def deco(fn):
+        @wraps(fn)
+        def inner(h, *a, **kw):
+            user = h.user
+            if not user:
+                raise HttpError(401, "not signed in")
+            if level == "author" and not auth.can_author(user):
+                raise HttpError(403, "forbidden")
+            if level == "admin" and not auth.is_admin(user):
+                raise HttpError(403, "forbidden")
+            return fn(h, *a, **kw)
+        return inner
+    return deco
+
+
+# ------------------------------------------------------------------ pages --
+def _page(name):
+    with open(os.path.join(WEB_DIR, name), "rb") as fh:
+        return fh.read()
+
+
+@route("GET", r"/(chat|studio|admin)?")
+def page_app(h, **_):
+    if not h.user:
+        return h.redirect("/login")
+    return h.send(200, _page("index.html"), "text/html; charset=utf-8")
+
+
+@route("GET", r"/login")
+def page_login(h):
+    if h.user:
+        return h.redirect("/")
+    return h.send(200, _page("login.html"), "text/html; charset=utf-8")
+
+
+@route("GET", r"/logout")
+def page_logout(h):
+    tok = h.cookie(auth.COOKIE)
+    if tok:
+        db.delete_session(tok)
+    return h.redirect("/login", [("Set-Cookie", f"{auth.COOKIE}=; Path=/; Max-Age=0")])
+
+
+@route("GET", r"/static/(?P<name>[A-Za-z0-9_.-]+)")
+def page_static(h, name):
+    path = os.path.join(WEB_DIR, name)
+    if not os.path.isfile(path):
+        raise HttpError(404, "not found")
+    ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    if ctype.startswith("text/") or ctype in ("application/javascript", "application/json"):
+        ctype += "; charset=utf-8"
+    with open(path, "rb") as fh:
+        # no-cache (not no-store): the browser revalidates, so editing a file during a
+        # demo shows up on reload without disabling caching entirely.
+        return h.send(200, fh.read(), ctype, [("Cache-Control", "no-cache")])
+
+
+@route("GET", r"/blob/(?P<key>[^/]+)")
+@needs()
+def page_blob(h, key):
+    if not BLOB_KEY.match(key):
+        raise HttpError(400, "bad blob key")
+    try:
+        data = mblob.store().get(key)
+    except OSError:
+        raise HttpError(404, "not found")
+    ctype = mimetypes.guess_type(key)[0] or "application/octet-stream"
+    return h.send(200, data, ctype, [("Cache-Control", "private, max-age=31536000, immutable")])
+
+
+# ------------------------------------------------------------------- auth --
+@route("POST", r"/api/login")
+def api_login(h):
+    body = h.json_body()
+    u = auth.authenticate(body.get("email", ""), body.get("password", ""))
+    if not u:
+        return h.json(200, {"ok": False, "error": "Wrong email or password."})
+    tok = db.create_session(u["id"])
+    return h.json(200, {"ok": True, "role": u["role"]},
+                  [("Set-Cookie", f"{auth.COOKIE}={tok}; Path=/; HttpOnly; SameSite=Lax")])
+
+
+@route("GET", r"/api/me")
+@needs()
+def api_me(h):
+    u = h.user
+    return h.json(200, {
+        "email": u["email"], "name": u["name"], "role": u["role"],
+        "can_author": auth.can_author(u), "is_admin": auth.is_admin(u),
+        "provider": settings.effective()["resolved_provider"],
+    })
+
+
+# ---------------------------------------------------------- conversations --
+def _title_from(question: str) -> str:
+    """Cheap, deterministic titles. A model-generated title would cost a whole extra
+    generation per new chat — on a local CPU model that is seconds of dead air."""
+    t = " ".join((question or "").split())
+    return (t[:47].rstrip() + "…") if len(t) > 48 else (t or "New chat")
+
+
+@route("GET", r"/api/conversations")
+@needs()
+def api_convs(h):
+    return h.json(200, db.list_conversations(h.user["id"]))
+
+
+@route("POST", r"/api/conversations")
+@needs()
+def api_conv_new(h):
+    return h.json(200, {"id": db.create_conversation(h.user["id"])})
+
+
+@route("GET", r"/api/conversations/(?P<cid>[a-f0-9]+)")
+@needs()
+def api_conv_get(h, cid):
+    conv = db.get_conversation(cid, h.user["id"])
+    if not conv:
+        raise HttpError(404, "no such conversation")
+    return h.json(200, {"id": conv["id"], "title": conv["title"],
+                        "messages": db.get_messages(cid)})
+
+
+@route("POST", r"/api/conversations/(?P<cid>[a-f0-9]+)/rename")
+@needs()
+def api_conv_rename(h, cid):
+    db.rename_conversation(cid, h.user["id"], h.json_body().get("title", "").strip() or "New chat")
+    return h.json(200, {"ok": True})
+
+
+@route("POST", r"/api/conversations/(?P<cid>[a-f0-9]+)/delete")
+@needs()
+def api_conv_delete(h, cid):
+    db.delete_conversation(cid, h.user["id"])
+    return h.json(200, {"ok": True})
+
+
+# -------------------------------------------------------------------- ask --
+def _profile(user):
+    return f"{user['name']} (role: {user['role']})"
+
+
+@route("POST", r"/api/ask")
+@needs()
+def api_ask(h):
+    body = h.json_body()
+    q = (body.get("question") or "").strip()
+    if not q:
+        raise HttpError(400, "question required")
+    return h.json(200, answer(q, profile=_profile(h.user), style=body.get("style", ""),
+                              asked_by=h.user["name"]))
+
+
+@route("POST", r"/api/ask/stream")
+@needs()
+def api_ask_stream(h):
+    body = h.json_body()
+    q = (body.get("question") or "").strip()
+    if not q:
+        raise HttpError(400, "question required")
+
+    user = h.user
+    cid = body.get("conversation_id")
+    conv = db.get_conversation(cid, user["id"]) if cid else None
+    # Whether to name this conversation properly once we've seen the answer. Only the first
+    # exchange earns a title: renaming a thread on its fifth message would move it under the
+    # reader while they were using it, and a title someone chose by hand must never be
+    # overwritten by a model.
+    needs_title = False
+    if not conv:
+        cid = db.create_conversation(user["id"], _title_from(q))
+        needs_title = True
+    elif not conv["title"] or conv["title"] == "New chat":
+        db.rename_conversation(cid, user["id"], _title_from(q))
+        needs_title = True
+
+    regenerate = bool(body.get("regenerate"))
+    if regenerate:
+        db.delete_last_exchange(cid)        # drop the previous answer, keep the question
+
+    # History is everything before this turn — the model must not see the question twice.
+    history = [{"role": m["role"], "content": m["content"]} for m in db.get_messages(cid)]
+    if regenerate and history and history[-1]["role"] == "user":
+        history = history[:-1]
+    else:
+        db.add_message(cid, "user", q)
+
+    # Past this point the response has begun, so nothing may raise out of here — the
+    # generic error handler would try to send a second set of headers into a live stream.
+    h.begin_sse()
+    h.sse("conversation", {"id": cid, "title": _title_from(q)})
+
+    answer, meta = "", {}
+    try:
+        for event, payload in answer_stream(q, profile=_profile(user),
+                                            style=body.get("style", ""), history=history,
+                                            asked_by=user["name"]):
+            if event == "delta":
+                answer += payload
+            elif event == "meta":
+                meta = payload
+            h.sse(event, payload)
+    except (BrokenPipeError, ConnectionResetError):
+        pass          # client hit Stop or navigated away — the partial answer is still saved
+    except Exception as e:
+        print(f"[spacebot] stream failed: {e!r}")
+        try:
+            h.sse("delta", "\n\nSorry — I hit an error finishing that answer.")
+        except OSError:
+            pass
+    finally:
+        if answer.strip():
+            db.add_message(cid, "assistant", answer, meta)
+
+    # Name the conversation now the exchange exists, not before it.
+    #
+    # Titling up front would mean a second model call standing between the user pressing
+    # Enter and their first token — seconds of dead air on a local CPU model, to produce a
+    # label they aren't looking at yet. Doing it here costs them nothing: the answer is on
+    # screen and being read, and the sidebar already shows the question-derived title, so
+    # this only ever replaces something serviceable with something better.
+    if needs_title and answer.strip() and not regenerate:
+        from sb.providers import get_provider
+        try:
+            better = get_provider().title(q, answer)
+        except Exception:
+            better = ""
+        if better:
+            db.rename_conversation(cid, user["id"], better)
+            try:
+                h.sse("title", {"id": cid, "title": better})
+            except OSError:
+                pass          # they navigated away; the title is saved either way
+    try:
+        h.sse("done", {})
+    except OSError:
+        pass
+    return True
+
+
+# ---------------------------------------------------------- authoring/ops --
+@route("GET", r"/api/catalog")
+@needs("author")
+def api_catalog(h):
+    return h.json(200, db.list_workflows())
+
+
+@route("GET", r"/api/gaps")
+@needs("author")
+def api_gaps(h):
+    return h.json(200, db.list_gaps())
+
+
+@route("GET", r"/api/jobs/(?P<jid>[a-f0-9]+)")
+@needs("author")
+def api_job(h, jid):
+    return h.json(200, db.get_job(jid) or {})
+
+
+@route("POST", r"/api/workflows/(?P<key>[^/]+)/publish")
+@needs("author")
+def api_publish(h, key):
+    db.set_workflow_status(key, "published")
+    # Publishing is what makes a workflow retrievable, so it is also when it gets indexed.
+    # Embedding runs inline: a few hundred milliseconds for a typical document, and it
+    # means the first question after Publish is already answerable semantically.
+    row = next((c for c in db.get_catalog() if c["wf_key"] == key), None)
+    indexed = chunks.reindex_workflow(row["id"]) if row else 0
+    embedded = chunks.embed_pending()
+    retrieval_invalidate()
+    db.log_audit(h.user["name"], h.user["email"], "published", key, f"{indexed} chunks")
+    return h.json(200, {"ok": True, "chunks": indexed, "embedded": embedded})
+
+
+def retrieval_invalidate():
+    from sb import retrieval
+    retrieval.invalidate()
+
+
+@route("GET", r"/api/index/status")
+@needs("author")
+def api_index_status(h):
+    from sb import embed
+    return h.json(200, {**chunks.stats(), "embedder": embed.get_embedder().health()})
+
+
+@route("POST", r"/api/index/rebuild")
+@needs("admin")
+def api_index_rebuild(h):
+    n = chunks.reindex_all()
+    out = {"chunks": n}
+    for _ in range(40):                      # bounded so one call can't run forever
+        r = chunks.embed_pending()
+        out["embedded"] = out.get("embedded", 0) + r.get("embedded", 0)
+        if r.get("error"):
+            out["error"] = r["error"]
+            break
+        if not r.get("pending"):
+            break
+    retrieval_invalidate()
+    return h.json(200, {**out, **chunks.stats()})
+
+
+@route("POST", r"/api/feed")
+@needs("author")
+def api_feed(h):
+    b = h.json_body()
+    try:
+        return h.json(200, ingest.structure_from_text(
+            b.get("wf_key", "").strip(), b.get("name", ""), b.get("category", ""),
+            b.get("owner", "") or h.user["name"], b.get("text", "")))
+    except Exception as e:
+        raise HttpError(400, str(e))
+
+
+@route("POST", r"/api/ingest")
+@needs("author")
+def api_ingest(h):
+    parts = h.multipart()
+    fields = {p["name"]: p["data"].decode("utf-8", "replace")
+              for p in parts if p.get("name") and not p.get("filename")}
+    files = [{"filename": p["filename"], "mime": p["content_type"], "bytes": p["data"]}
+             for p in parts if p.get("filename")]
+    if fields.get("text", "").strip():
+        files.append({"filename": "pasted.txt", "mime": "text/plain",
+                      "bytes": fields["text"].encode("utf-8")})
+    if not fields.get("wf_key", "").strip() or not files:
+        raise HttpError(400, "A workflow ID and at least one file (or some text) are required.")
+    wf_key = fields["wf_key"].strip()
+    job_id = mpipe.start_ingest(wf_key, fields.get("name", ""),
+                                fields.get("category", ""),
+                                fields.get("owner", "") or h.user["name"], files,
+                                actor=h.user["name"])
+    db.log_audit(h.user["name"], h.user["email"], "ingested", wf_key,
+                 f"{len(files)} file(s)")
+    return h.json(200, {"job_id": job_id})
+
+
+# ------------------------------------------------------------- knowledge --
+@route("GET", r"/api/workflows/(?P<key>[^/]+)")
+@needs("author")
+def api_workflow_get(h, key):
+    """The full entry, for a senior reviewing what's actually published."""
+    card = next((c for c in db.list_workflows() if c["wf_key"] == key), None)
+    if not card:
+        raise HttpError(404, "no such workflow")
+    pkg = db.get_package(card["id"]) or {}
+    return h.json(200, {**pkg, "status": card["status"],
+                        "created_by": card.get("created_by", ""),
+                        "updated_by": card.get("updated_by", ""),
+                        "updated_at": card.get("updated_at")})
+
+
+@route("POST", r"/api/workflows/(?P<key>[^/]+)/update")
+@needs("author")
+def api_workflow_update(h, key):
+    body = h.json_body()
+    fields = {k: body.get(k) for k in ("name", "summary", "category", "owner")
+              if body.get(k) is not None}
+    if not db.update_workflow_meta(key, fields, actor=h.user["name"]):
+        raise HttpError(404, "no such workflow, or nothing to change")
+    # The name and summary are both embedded into this workflow's chunks, so an edit that
+    # skipped reindexing would leave retrieval matching against the old wording.
+    card = next((c for c in db.list_workflows() if c["wf_key"] == key), None)
+    if card:
+        chunks.reindex_workflow(card["id"])
+        chunks.embed_pending()
+    retrieval_invalidate()
+    db.log_audit(h.user["name"], h.user["email"], "edited", key,
+                 ", ".join(sorted(fields)))
+    return h.json(200, {"ok": True})
+
+
+@route("POST", r"/api/workflows/(?P<key>[^/]+)/delete")
+@needs("author")
+def api_workflow_delete(h, key):
+    if not db.delete_workflow(key):
+        raise HttpError(404, "no such workflow")
+    retrieval_invalidate()
+    db.log_audit(h.user["name"], h.user["email"], "deleted", key, "")
+    return h.json(200, {"ok": True})
+
+
+# ------------------------------------------------------------------ audit --
+@route("GET", r"/api/admin/overview")
+@needs("admin")
+def api_admin_overview(h):
+    return h.json(200, db.admin_overview())
+
+
+# --------------------------------------------------------------- settings --
+SETTING_KEYS = ("llm_provider", "anthropic_api_key", "openai_api_key", "openai_base_url",
+                "ollama_base_url", "route_model", "compose_model", "vision_model")
+
+
+@route("GET", r"/api/settings")
+@needs("admin")
+def api_settings_get(h):
+    return h.json(200, settings.public_view())
+
+
+@route("POST", r"/api/settings")
+@needs("admin")
+def api_settings_set(h):
+    body = h.json_body()
+    if body.get("ollama_base_url"):
+        body["ollama_base_url"] = settings.normalize_ollama_url(body["ollama_base_url"])
+    for k in SETTING_KEYS:
+        if k in body and body[k] != "":
+            db.set_setting(k, body[k])
+    # Switching provider must not leave the previous provider's model name behind.
+    if body.get("llm_provider") and not body.get("compose_model"):
+        for k in ("route_model", "compose_model", "vision_model"):
+            db.set_setting(k, "")
+    return h.json(200, settings.public_view())
+
+
+@route("GET", r"/api/model/health")
+@needs("admin")
+def api_health(h):
+    from sb.providers import get_provider
+    return h.json(200, get_provider().health())
+
+
+# ------------------------------------------------------------- multipart ---
 def _cd_param(cd, key):
     m = re.search(key + r'="([^"]*)"', cd)
     return m.group(1) if m else None
 
 
 def parse_multipart(body: bytes, boundary: str) -> list:
-    """Minimal multipart/form-data parser (stdlib has none since cgi was removed).
+    """Minimal multipart/form-data parser (the stdlib lost one when cgi was removed).
     Good enough for the POC; production uploads go presigned direct-to-bucket instead."""
     parts, delim = [], b"--" + boundary.encode()
     for seg in body.split(delim):
@@ -440,208 +510,221 @@ def parse_multipart(body: bytes, boundary: str) -> list:
     return parts
 
 
+# --------------------------------------------------------------- handler ---
+MAX_BODY = 64 * 1024 * 1024      # generous for screenshot batches, bounded so we can't OOM
+
+
 class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "Spacebot"
+    sys_version = ""
+
     def log_message(self, *a):
         pass
 
-    def _send(self, code, body, ctype="application/json", extra=None):
-        data = body if isinstance(body, bytes) else body.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        for h in (extra or []):
-            self.send_header(*h)
-        self.end_headers()
-        self.wfile.write(data)
+    # -- request helpers ---------------------------------------------------
+    @property
+    def user(self):
+        if not hasattr(self, "_user"):
+            self._user = db.get_session_user(self.cookie(auth.COOKIE))
+        return self._user
 
-    def _redirect(self, loc, extra=None):
-        self.send_response(302)
-        self.send_header("Location", loc)
-        for h in (extra or []):
-            self.send_header(*h)
-        self.end_headers()
-
-    def _body(self):
-        n = int(self.headers.get("Content-Length", 0) or 0)
-        return json.loads(self.rfile.read(n).decode("utf-8") or "{}") if n else {}
-
-    def _cookie(self, name):
-        raw = self.headers.get("Cookie", "") or ""
-        for part in raw.split(";"):
+    def cookie(self, name):
+        for part in (self.headers.get("Cookie", "") or "").split(";"):
             if "=" in part:
                 k, v = part.strip().split("=", 1)
                 if k == name:
                     return v
         return None
 
-    def _user(self):
-        return db.get_session_user(self._cookie(auth.COOKIE))
-
-    # ---- GET ----
-    def do_GET(self):
-        p = self.path.split("?")[0]
-        if p == "/login":
-            return self._redirect("/") if self._user() else self._send(200, LOGIN_HTML, "text/html; charset=utf-8")
-        if p == "/logout":
-            tok = self._cookie(auth.COOKIE)
-            if tok:
-                db.delete_session(tok)
-            return self._redirect("/login", [("Set-Cookie", f"{auth.COOKIE}=; Path=/; Max-Age=0")])
-
-        user = self._user()
-        if not user:
-            if p.startswith("/api/"):
-                return self._send(401, json.dumps({"error": "not signed in"}))
-            return self._redirect("/login")
-
-        if p in ("/", "/chat", "/studio", "/admin"):
-            return self._send(200, APP_HTML, "text/html; charset=utf-8")
-        if p == "/api/me":
-            return self._send(200, json.dumps({**{k: user[k] for k in ("email", "name", "role")},
-                                               "provider": settings.effective()["resolved_provider"]}))
-        if p == "/api/catalog":
-            if not auth.can_author(user):
-                return self._send(403, json.dumps({"error": "forbidden"}))
-            return self._send(200, json.dumps(db.list_workflows()))
-        if p == "/api/gaps":
-            if not auth.can_author(user):
-                return self._send(403, json.dumps({"error": "forbidden"}))
-            return self._send(200, json.dumps(db.list_gaps()))
-        if p == "/api/settings":
-            if not auth.is_admin(user):
-                return self._send(403, json.dumps({"error": "forbidden"}))
-            return self._send(200, json.dumps(settings.public_view()))
-        if p == "/api/model/health":
-            if not auth.is_admin(user):
-                return self._send(403, json.dumps({"error": "forbidden"}))
-            return self._send(200, json.dumps(get_provider().health()))
-        if p.startswith("/api/jobs/"):
-            if not auth.can_author(user):
-                return self._send(403, json.dumps({"error": "forbidden"}))
-            return self._send(200, json.dumps(db.get_job(p.rsplit("/", 1)[-1]) or {}))
-        if p.startswith("/blob/"):
-            key = p[len("/blob/"):]
-            try:
-                data = mblob.store().get(key)
-            except Exception:
-                return self._send(404, b"not found", "text/plain")
-            ext = key.rsplit(".", 1)[-1].lower() if "." in key else ""
-            return self._send(200, data, CTYPES.get(ext, "application/octet-stream"))
-        return self._send(404, json.dumps({"error": "not found"}))
-
-    # ---- POST ----
-    def do_POST(self):
-        p = self.path.split("?")[0]
-
-        # multipart ingest is handled before JSON parsing (raw body + auth)
-        if p == "/api/ingest":
-            user = self._user()
-            if not user:
-                return self._send(401, json.dumps({"error": "not signed in"}))
-            if not auth.can_author(user):
-                return self._send(403, json.dumps({"error": "forbidden"}))
-            ctype = self.headers.get("Content-Type", "")
+    def raw_body(self):
+        if not hasattr(self, "_raw"):
             n = int(self.headers.get("Content-Length", 0) or 0)
-            raw = self.rfile.read(n)
-            boundary = ctype.split("boundary=", 1)[-1].strip().strip('"') if "boundary=" in ctype else ""
-            parts = parse_multipart(raw, boundary) if boundary else []
-            fields = {pp["name"]: pp["data"].decode("utf-8", "replace")
-                      for pp in parts if pp.get("name") and not pp.get("filename")}
-            files = [{"filename": pp["filename"], "mime": pp["content_type"], "bytes": pp["data"]}
-                     for pp in parts if pp.get("filename")]
-            if fields.get("text", "").strip():
-                files.append({"filename": "pasted.txt", "mime": "text/plain",
-                              "bytes": fields["text"].encode("utf-8")})
-            if not fields.get("wf_key", "").strip() or not files:
-                return self._send(400, json.dumps({"error": "workflow id and at least one file (or text) required"}))
-            job_id = mpipe.start_ingest(fields["wf_key"].strip(), fields.get("name", ""),
-                                        fields.get("category", ""), fields.get("owner", "") or user["name"], files)
-            return self._send(200, json.dumps({"job_id": job_id}))
+            if n > MAX_BODY:
+                raise HttpError(413, "upload too large")
+            self._raw = self.rfile.read(n) if n else b""
+        return self._raw
 
+    def json_body(self):
+        raw = self.raw_body()
+        if not raw:
+            return {}
         try:
-            body = self._body()
-        except Exception as e:
-            return self._send(400, json.dumps({"error": f"bad json: {e}"}))
+            return json.loads(raw.decode("utf-8"))
+        except ValueError as e:
+            raise HttpError(400, f"bad json: {e}")
 
-        if p == "/api/login":
-            u = auth.authenticate(body.get("email", ""), body.get("password", ""))
-            if not u:
-                return self._send(200, json.dumps({"ok": False, "error": "wrong email or password"}))
-            tok = db.create_session(u["id"])
-            return self._send(200, json.dumps({"ok": True, "role": u["role"]}),
-                              extra=[("Set-Cookie", f"{auth.COOKIE}={tok}; Path=/; HttpOnly; SameSite=Lax")])
+    def multipart(self):
+        ctype = self.headers.get("Content-Type", "")
+        if "boundary=" not in ctype:
+            raise HttpError(400, "expected multipart/form-data")
+        boundary = ctype.split("boundary=", 1)[-1].strip().strip('"')
+        return parse_multipart(self.raw_body(), boundary)
 
-        user = self._user()
-        if not user:
-            return self._send(401, json.dumps({"error": "not signed in"}))
+    # -- response helpers --------------------------------------------------
+    def send(self, code, body, ctype="application/json", extra=None):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for kv in (extra or []):
+            self.send_header(*kv)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+        return True
 
-        if p == "/api/ask":
-            q = (body.get("question") or "").strip()
-            if not q:
-                return self._send(400, json.dumps({"error": "question required"}))
-            profile = f"{user['name']} (role: {user['role']})"
-            return self._send(200, json.dumps(ask(q, profile=profile, style=body.get("style", ""))))
+    def json(self, code, obj, extra=None):
+        return self.send(code, json.dumps(obj), "application/json; charset=utf-8", extra)
 
-        if p == "/api/ask/stream":
-            q = (body.get("question") or "").strip()
-            if not q:
-                return self._send(400, json.dumps({"error": "question required"}))
-            profile = f"{user['name']} (role: {user['role']})"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
-            self.end_headers()
+    def redirect(self, loc, extra=None):
+        self.send_response(302)
+        self.send_header("Location", loc)
+        self.send_header("Content-Length", "0")
+        for kv in (extra or []):
+            self.send_header(*kv)
+        self.end_headers()
+        return True
 
-            def sse(event, data):
-                self.wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8"))
-                self.wfile.flush()
+    def begin_sse(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.end_headers()
 
+    def sse(self, event, data):
+        self.wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
+    # -- dispatch ----------------------------------------------------------
+    def _dispatch(self, method):
+        # HTTP/1.1 keep-alive reuses one handler instance for several requests, so
+        # per-request caches MUST be cleared here or request N+1 replays request N's body.
+        for attr in ("_user", "_raw"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        allowed = False
+        for m, rx, fn in ROUTES:
+            match = rx.match(path)
+            if not match:
+                continue
+            if m != method:
+                allowed = True
+                continue
             try:
-                # live tokens straight from the model as they are generated
-                for event, payload in ask_stream(q, profile=profile, style=body.get("style", "")):
-                    sse(event, payload)
-                sse("done", {})
+                return fn(self, **match.groupdict())
+            except HttpError as e:
+                return self._fail(path, e.code, e.message)
             except (BrokenPipeError, ConnectionResetError):
-                pass          # client hit Stop / navigated away
-            return
+                return
+            except Exception as e:                       # never leak a traceback to the client
+                print(f"[spacebot] {method} {path} failed: {e!r}")
+                return self._fail(path, 500, "internal error")
+            finally:
+                self._drain()
+        try:
+            return self._fail(path, 405 if allowed else 404,
+                              "method not allowed" if allowed else "not found")
+        finally:
+            self._drain()
 
-        if p == "/api/feed":
-            if not auth.can_author(user):
-                return self._send(403, json.dumps({"error": "forbidden"}))
+    def _drain(self):
+        """Consume any request body the handler didn't read.
+
+        On a keep-alive connection the next request is parsed from wherever the last one
+        stopped reading. A handler that ignores its body — /delete and /publish take their
+        arguments from the URL — leaves those bytes in the socket, and the following
+        request line parses as `{}POST /api/... HTTP/1.1`, which the stdlib rejects with
+        "Unsupported method ('{}POST')". Every POST after the first on that connection
+        fails with a 501.
+
+        Draining unconditionally is the fix, rather than making every handler read a body
+        it doesn't want.
+        """
+        if hasattr(self, "_raw"):
+            return                       # handler already consumed it
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
             try:
-                r = ingest.structure_from_text(body.get("wf_key", "").strip(), body.get("name", ""),
-                                               body.get("category", ""), body.get("owner", "") or user["name"],
-                                               body.get("text", ""))
-                return self._send(200, json.dumps(r))
-            except Exception as e:
-                return self._send(200, json.dumps({"error": str(e)}))
+                self.rfile.read(n)
+            except OSError:
+                pass
+        self._raw = b""
 
-        if p == "/api/settings":
-            if not auth.is_admin(user):
-                return self._send(403, json.dumps({"error": "forbidden"}))
-            for k in ("llm_provider", "anthropic_api_key", "openai_api_key", "openai_base_url",
-                      "ollama_base_url", "route_model", "compose_model", "vision_model"):
-                if k in body and body[k] != "":
-                    db.set_setting(k, body[k])
-            return self._send(200, json.dumps(settings.public_view()))
+    def _fail(self, path, code, message):
+        if path.startswith("/api/"):
+            return self.json(code, {"error": message})
+        if code in (401, 403):
+            return self.redirect("/login")
+        return self.send(code, message, "text/plain; charset=utf-8")
 
-        if p.startswith("/api/workflows/") and p.endswith("/publish"):
-            if not auth.can_author(user):
-                return self._send(403, json.dumps({"error": "forbidden"}))
-            db.set_workflow_status(p.split("/")[3], "published")
-            return self._send(200, json.dumps({"ok": True}))
+    def do_GET(self):
+        self._dispatch("GET")
 
-        return self._send(404, json.dumps({"error": "not found"}))
+    def do_POST(self):
+        self._dispatch("POST")
 
 
 def main():
     db.init_db()
     n = len(db.get_catalog())
-    print(f"Spacebot on http://localhost:{PORT}   ({n} workflows)")
-    if n == 0 or not db.get_user_by_email("raj@spacelabs.dev"):
-        print("  tip: run  python3 seed.py  first (loads workflows + demo logins)")
-    ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
+    s = settings.effective()
+    prov = s["resolved_provider"]
+
+    print(f"\n  🛰  Spacebot  →  http://localhost:{PORT}")
+    print(f"      {n} published workflow{'' if n == 1 else 's'}  ·  model: {prov}", end="")
+    if prov == "ollama":
+        print(f" ({s['compose_model']}) at {s['ollama_base_url']}")
+    else:
+        print()
+    if prov == "mock":
+        print("      No model reachable — running the offline heuristic.")
+        print("      Start Ollama and pull a model for real answers:")
+        print("        ollama serve  &&  ollama pull llama3.2:3b")
+    # Checked by count, not by a named account: hardcoding one demo login here meant that
+    # renaming the demo users left the server permanently advising a reseed it did not need.
+    if n == 0 or db.count_users() == 0:
+        print("      Nobody can sign in yet. Either:")
+        print("        python3 setup.py --org 'Your Company' --admin you@example.com")
+        print("        python3 seed.py            (demo data + demo logins)")
+    print()
+
+    try:
+        ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
+    except OSError as e:
+        # "Address already in use" is the most common way this program fails, and a raw
+        # traceback makes it look like the app is broken when in fact it is already
+        # running. Say which process, and give the two ways out.
+        if e.errno != errno.EADDRINUSE:
+            raise
+        print(f"\n  Port {PORT} is already in use — Spacebot may already be running.")
+        print(f"      Open http://localhost:{PORT} to check.\n")
+        holder = ""
+        try:
+            out = subprocess.run(["ss", "-lptnH", f"sport = :{PORT}"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            m = re.search(r"pid=(\d+)", out)
+            holder = m.group(1) if m else ""
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if holder:
+            print(f"      Held by process {holder}. To take the port over:")
+            print(f"        kill {holder} && python3 server.py")
+        else:
+            print("      To find and stop whatever holds it:")
+            print(f"        ss -lptn 'sport = :{PORT}'")
+        print(f"\n      Or run this copy somewhere else:")
+        print(f"        SPACEBOT_PORT=8081 python3 server.py\n")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

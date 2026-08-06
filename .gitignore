@@ -1,0 +1,21 @@
+# Runtime data — never in version control.
+#
+# spacebot.db holds password hashes, live session tokens, every conversation and the full
+# text of every ingested document. data/blobs holds the raw uploaded files themselves. On a
+# public repository that is somebody's CV and somebody's credentials, so the whole directory
+# stays local. Each deployment builds its own via setup.py + ingest.py.
+spacebot/data/
+data/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Logs and local scratch
+*.log
+.claude/
+
+# Editor / OS noise
+.DS_Store
+.vscode/
+.idea/

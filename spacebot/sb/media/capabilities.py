@@ -31,13 +31,70 @@ def scan_secrets(text: str) -> bool:
     return any(p.search(text or "") for p in SECRET_PATTERNS)
 
 
-# ---- Image understanding (available now via the LLM vision provider) -------
+# ---- OCR -------------------------------------------------------------------
+class Ocr:
+    """Text inside an image or a scanned page.
+
+    Tried before the vision model because it is ~100x cheaper and exact on printed text —
+    a vision model paraphrases what it reads, which is fine for "what is this a screenshot
+    of" and wrong for "what does this invoice say".
+    """
+    def available(self) -> bool:
+        if shutil.which("tesseract") is None:
+            return False
+        try:
+            import pytesseract  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def read(self, image_bytes: bytes) -> str:
+        if not self.available():
+            raise CapabilityUnavailable(
+                "OCR needs tesseract and pytesseract — install the binary "
+                "(apt-get install tesseract-ocr) then: pip install --user pytesseract")
+        import io
+        import pytesseract
+        from PIL import Image
+        try:
+            return (pytesseract.image_to_string(Image.open(io.BytesIO(image_bytes))) or "").strip()
+        except Exception as e:
+            raise CapabilityUnavailable(f"OCR failed: {e}")
+
+
+def get_ocr() -> Ocr:
+    return Ocr()
+
+
+# ---- Image understanding ----------------------------------------------------
 class ImageUnderstander:
+    """OCR first for literal text, then the vision model for what the image shows.
+
+    Both are optional and each covers a different need, so we take whatever is available
+    and record honestly when neither is.
+    """
     def describe(self, image_bytes: bytes, mime="image/png") -> dict:
-        # Uses whichever model provider is configured (Claude/OpenAI vision, or mock).
-        desc = providers.get_provider().describe_image(image_bytes, mime)
-        text = " ".join(x for x in [desc.get("screen"), desc.get("action"), desc.get("text")] if x).strip()
+        ocr_text = ""
+        ocr = get_ocr()
+        if ocr.available():
+            try:
+                ocr_text = ocr.read(image_bytes)
+            except CapabilityUnavailable:
+                ocr_text = ""
+
+        try:
+            desc = providers.get_provider().describe_image(image_bytes, mime)
+        except Exception as e:
+            if not ocr_text:
+                raise CapabilityUnavailable(f"no OCR and no vision model available ({e})")
+            desc = {"screen": "", "action": "", "text": ocr_text, "alt_text": ""}
+
+        parts = [desc.get("screen"), desc.get("action"), desc.get("text")]
+        if ocr_text and ocr_text not in (desc.get("text") or ""):
+            parts.append("Text in image: " + ocr_text)
+        text = " ".join(x for x in parts if x).strip()
         desc["_text"] = text
+        desc["_ocr"] = bool(ocr_text)
         desc["contains_secret"] = bool(desc.get("contains_secret") or scan_secrets(text))
         return desc
 

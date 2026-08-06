@@ -1,8 +1,17 @@
-"""Seed Spacebot with realistic SpaceLabs workflows so the demo has something to answer.
+"""DEMO DATA ONLY — a fictional company, so there is something to ask about out of the box.
 
-These are hand-authored structured workflows (the shape a senior's material becomes after
-ingestion). They exercise every routing path: scoped answer, error-code match,
-disambiguation between two similar workflows, and a multi-workflow journey.
+Do not run this on a deployment you care about. The logins below have published passwords,
+and the workflows belong to an invented company that is not yours.
+
+For a real install use `setup.py`, which creates one admin account with a password you
+choose or one that is generated, and leaves the knowledge base empty:
+
+    python3 setup.py --org "Your Company" --admin you@yourcompany.com
+    python3 ingest.py ./your-documents --publish
+
+These workflows are hand-authored in the shape a senior's material takes after ingestion,
+and they exercise every retrieval path: a scoped answer, an error-code match, two similar
+workflows that must not be confused, and a question spanning several documents.
 
 Run:  python3 seed.py
 """
@@ -10,8 +19,8 @@ from sb import auth, db
 
 USERS = [
     # email, name, role, password
-    ("raj@spacelabs.dev", "Raj (new hire)", "user", "raj123"),
-    ("sarah@spacelabs.dev", "Sarah (senior)", "author", "sarah123"),
+    ("yaswanth@spacelabs.dev", "Yaswanth (new hire)", "user", "yaswanth123"),
+    ("roshan@spacelabs.dev", "Roshan (senior)", "author", "roshan123"),
     ("admin@spacelabs.dev", "Admin", "admin", "admin123"),
 ]
 
@@ -182,6 +191,13 @@ RELATIONS = [
 
 def main():
     db.init_db()
+    if db.list_workflows():
+        print("This database already has content. seed.py loads DEMO data over the top,")
+        print("including logins whose passwords are published in this file.")
+        print("If that is what you want, pass --yes.\n")
+        import sys
+        if "--yes" not in sys.argv:
+            return
     for wf in WORKFLOWS:
         db.upsert_workflow(wf)
         print(f"  seeded {wf['wf_key']}  ({len(wf['steps'])} steps)")
@@ -190,9 +206,10 @@ def main():
     for email, name, role, pw in USERS:
         auth.ensure_user(email, name, role, pw)
     print(f"\nDone. {len(WORKFLOWS)} workflows, {len(RELATIONS)} relations, {len(USERS)} users.")
-    print("\nLogins:")
+    print("\nDemo logins (passwords are public — demo use only):")
     for email, name, role, pw in USERS:
         print(f"  {role:6} {email}  /  {pw}")
+    print("\nFor your own deployment instead: python3 setup.py --org ... --admin ...")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Sign in · Spacebot</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+<script>
+  (function () {
+    var t = localStorage.getItem('sb-theme');
+    if (!t) t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
+</head>
+<body class="auth-body">
+
+<button class="iconbtn auth__theme" id="themeBtn" type="button"></button>
+
+<!-- One centred column. `margin:auto` on a flex child centres without clipping when the
+     content is taller than the viewport, which plain `place-items:center` does not. -->
+<div class="auth">
+  <main class="auth__box">
+    <div class="auth__head">
+      <div class="logo logo--lg" id="brandLogo"></div>
+      <h1>Sign in to Spacebot</h1>
+      <p>Your team's onboarding brain — grounded in what your seniors actually wrote down.</p>
+    </div>
+
+    <form id="form" novalidate>
+      <label class="field"><span>Email</span>
+        <input id="email" type="email" autocomplete="username" autofocus required
+               placeholder="you@spacelabs.dev" enterkeyhint="next"></label>
+      <label class="field"><span>Password</span>
+        <input id="pw" type="password" autocomplete="current-password" required
+               placeholder="••••••••" enterkeyhint="go"></label>
+      <button class="btn" type="submit" id="submit">Sign in</button>
+      <p class="auth__err" id="err" role="alert" aria-live="polite"></p>
+    </form>
+
+    <div class="auth__sep">or continue as</div>
+    <div class="demo" id="demo"></div>
+
+    <p class="auth__foot">Runs entirely on this machine · nothing leaves your network</p>
+  </main>
+</div>
+
+<script type="module">
+import { ICON, LOGO } from '/static/icons.js';
+
+const $ = s => document.querySelector(s);
+
+$('#brandLogo').innerHTML = LOGO;
+
+function applyTheme(t, persist = true) {
+  document.documentElement.dataset.theme = t;
+  if (persist) localStorage.setItem('sb-theme', t);
+  const b = $('#themeBtn');
+  b.innerHTML = t === 'light' ? ICON.moon : ICON.sun;
+  b.title = t === 'light' ? 'Switch to dark' : 'Switch to light';
+  b.setAttribute('aria-label', b.title);
+}
+applyTheme(document.documentElement.dataset.theme, false);
+$('#themeBtn').onclick = () =>
+  applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
+
+const DEMO = [
+  ['yaswanth@spacelabs.dev', 'yaswanth123', 'Y', 'Yaswanth', 'New hire'],
+  ['roshan@spacelabs.dev',   'roshan123',   'R', 'Roshan',   'Senior'],
+  ['admin@spacelabs.dev',    'admin123',    'A', 'Admin',    'Full access'],
+];
+$('#demo').innerHTML = DEMO.map(([e, p, i, name, role]) =>
+  `<button type="button" data-e="${e}" data-p="${p}" title="${name} — ${role}">
+     <span class="demo__av">${i}</span>
+     <b>${name}</b><span>${role}</span>
+   </button>`).join('');
+
+document.querySelectorAll('#demo button').forEach(b => {
+  b.onclick = () => {
+    $('#email').value = b.dataset.e;
+    $('#pw').value = b.dataset.p;
+    $('#form').requestSubmit();
+  };
+});
+
+$('#form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const btn = $('#submit');
+  const email = $('#email').value.trim();
+  const pw = $('#pw').value;
+  $('#err').textContent = '';
+  if (!email || !pw) { $('#err').textContent = 'Enter your email and password.'; return; }
+
+  btn.disabled = true;
+  btn.textContent = 'Signing in…';
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email, password: pw }),
+    });
+    const d = await r.json();
+    if (d.ok) { location.href = '/'; return; }
+    $('#err').textContent = d.error || 'Sign in failed';
+  } catch {
+    $('#err').textContent = 'Could not reach the server.';
+  }
+  btn.disabled = false;
+  btn.textContent = 'Sign in';
+});
+</script>
+</body>
+</html>

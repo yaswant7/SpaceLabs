@@ -7,6 +7,7 @@ Add a modality = add an adapter here. Nothing downstream changes, because everyt
 downstream consumes Segments, not files. That is the whole point.
 """
 import io
+import re
 
 from .capabilities import CapabilityUnavailable, get_frame_extractor, get_transcriber
 
@@ -16,11 +17,19 @@ def guess_kind(mime: str, filename: str) -> str:
     f = (filename or "").lower()
     if "pdf" in m or f.endswith(".pdf"):
         return "pdf"
-    if m.startswith("image/") or f.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+    if f.endswith((".docx", ".docm")) or "wordprocessingml" in m:
+        return "docx"
+    if f.endswith((".xlsx", ".xlsm")) or "spreadsheetml" in m:
+        return "sheet"
+    if f.endswith((".csv", ".tsv")) or m in ("text/csv", "text/tab-separated-values"):
+        return "csv"
+    if f.endswith((".html", ".htm")) or "text/html" in m:
+        return "html"
+    if m.startswith("image/") or f.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff")):
         return "image"
-    if m.startswith("video/") or f.endswith((".mp4", ".mov", ".webm", ".mkv")):
+    if m.startswith("video/") or f.endswith((".mp4", ".mov", ".webm", ".mkv", ".avi")):
         return "video"
-    if m.startswith("audio/") or f.endswith((".mp3", ".wav", ".m4a", ".ogg")):
+    if m.startswith("audio/") or f.endswith((".mp3", ".wav", ".m4a", ".ogg", ".flac")):
         return "audio"
     return "transcript"
 
@@ -32,13 +41,27 @@ class Adapter:
 
 class PdfAdapter(Adapter):
     """PDF = a mix of text and embedded screenshots. Each page -> a text segment;
-    each embedded image on the page -> its own image segment, anchored to that page."""
+    each embedded image on the page -> its own image segment, anchored to that page.
+
+    Every failure here RAISES. It must never return a diagnostic string as if it were the
+    document's content: downstream, the structuring model treats whatever it is handed as
+    source material, so a returned "[PDF parsing needs pypdf]" once became a fully
+    invented, published, high-confidence workflow about parsing PDFs. An unreadable source
+    has to stop the pipeline, not feed it.
+    """
     def decompose(self, data, filename):
         try:
             import pypdf
         except ImportError:
-            return [{"modality": "text", "text": "[PDF parsing needs pypdf]", "anchor": {}}]
-        reader = pypdf.PdfReader(io.BytesIO(data))
+            raise CapabilityUnavailable(
+                "PDF text extraction needs pypdf — run: pip install --user pypdf")
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(data))
+        except Exception as e:
+            raise CapabilityUnavailable(f"could not open this PDF ({e})")
+        if getattr(reader, "is_encrypted", False):
+            raise CapabilityUnavailable("this PDF is password-protected")
+
         out = []
         for i, page in enumerate(reader.pages):
             txt = (page.extract_text() or "").strip()
@@ -51,7 +74,11 @@ class PdfAdapter(Adapter):
                                 "meta": {"from_pdf": True, "name": getattr(img, "name", "")}})
             except Exception:
                 pass   # some PDFs have unreadable image streams; text still captured
-        return out or [{"modality": "text", "text": "[empty PDF]", "anchor": {}}]
+        if not out:
+            raise CapabilityUnavailable(
+                "no text or images could be extracted — this looks like a scanned PDF, "
+                "which needs OCR")
+        return out
 
 
 class ImageAdapter(Adapter):
@@ -80,6 +107,144 @@ class TranscriptAdapter(Adapter):
         return [{"modality": "text", "text": c, "anchor": {"para": i + 1}}
                 for i, c in enumerate(chunks) if c] or \
                [{"modality": "text", "text": text.strip(), "anchor": {}}]
+
+
+class DocxAdapter(Adapter):
+    """Word documents. Paragraphs in order, headings kept as headings so the structure
+    survives into chunking, and tables flattened to pipe rows — a table read as one blob
+    of numbers retrieves badly, a table read as rows retrieves per row."""
+    def decompose(self, data, filename):
+        try:
+            import docx
+        except ImportError:
+            raise CapabilityUnavailable(
+                "DOCX support needs python-docx — run: pip install --user python-docx")
+        try:
+            doc = docx.Document(io.BytesIO(data))
+        except Exception as e:
+            raise CapabilityUnavailable(f"could not open this DOCX ({e})")
+
+        out, buf, para_no = [], [], 0
+        for p in doc.paragraphs:
+            text = (p.text or "").strip()
+            if not text:
+                continue
+            style = (p.style.name or "").lower() if p.style is not None else ""
+            if style.startswith("heading") and buf:
+                para_no += 1
+                out.append({"modality": "text", "text": "\n".join(buf),
+                            "anchor": {"para": para_no}})
+                buf = []
+            buf.append(f"## {text}" if style.startswith("heading") else text)
+        if buf:
+            para_no += 1
+            out.append({"modality": "text", "text": "\n".join(buf), "anchor": {"para": para_no}})
+
+        for ti, table in enumerate(doc.tables, 1):
+            rows = [" | ".join((c.text or "").strip() for c in r.cells) for r in table.rows]
+            rows = [r for r in rows if r.strip(" |")]
+            if rows:
+                out.append({"modality": "text", "text": "\n".join(rows),
+                            "anchor": {"table": ti}, "meta": {"kind": "table"}})
+
+        if not out:
+            raise CapabilityUnavailable("this DOCX has no extractable text")
+        return out
+
+
+def _row_segments(header, rows, anchor_key, anchor_value, max_rows=2000):
+    """Tabular data → one segment per row, each carrying its column names.
+
+    Row-level granularity is not a detail. Packed as one blob, a model answering "who is
+    on call in W32?" has to align columns across lines and reliably blends adjacent rows —
+    it returned W33's people for a W32 question. One row per segment makes each row an
+    independently retrievable fact and the confusion disappears.
+
+    Wide sheets are batched rather than truncated so a big export degrades in resolution,
+    not in coverage.
+    """
+    header = [h.strip() for h in header]
+    body = [r for r in rows if any((c or "").strip() for c in r)]
+    per = max(1, -(-len(body) // max_rows))          # rows per segment, ceil division
+    out = []
+    for i in range(0, len(body), per):
+        group = body[i:i + per]
+        lines = ["; ".join(f"{h}: {c}" for h, c in zip(header, r)
+                           if (c or "").strip() and h)
+                 for r in group]
+        lines = [ln for ln in lines if ln]
+        if not lines:
+            continue
+        prefix = f"{anchor_key.title()} {anchor_value} — " if anchor_value else ""
+        out.append({
+            "modality": "text",
+            "text": f"{prefix}columns: {', '.join(h for h in header if h)}\n" + "\n".join(lines),
+            "anchor": {anchor_key: anchor_value, "row": i + 2},
+            "meta": {"kind": "table_row", "rows": len(lines)},
+        })
+    return out
+
+
+class SheetAdapter(Adapter):
+    """Spreadsheets. One segment per row (see _row_segments), with the header repeated so
+    a row retrieved alone still says what its columns mean."""
+    MAX_ROWS = 2000
+
+    def decompose(self, data, filename):
+        try:
+            import openpyxl
+        except ImportError:
+            raise CapabilityUnavailable(
+                "Spreadsheet support needs openpyxl — run: pip install --user openpyxl")
+        try:
+            wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        except Exception as e:
+            raise CapabilityUnavailable(f"could not open this spreadsheet ({e})")
+
+        out = []
+        for ws in wb.worksheets:
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows:
+                continue
+            header = [str(c) if c is not None else "" for c in rows[0]]
+            cells = [[str(c) if c is not None else "" for c in r] for r in rows[1:]]
+            out.extend(_row_segments(header, cells, "sheet", ws.title, self.MAX_ROWS))
+        wb.close()
+        if not out:
+            raise CapabilityUnavailable("this spreadsheet has no readable rows")
+        return out
+
+
+class CsvAdapter(Adapter):
+    def decompose(self, data, filename):
+        import csv as _csv
+        text = data.decode("utf-8-sig", "replace") if isinstance(data, bytes) else str(data)
+        delim = "\t" if filename.lower().endswith(".tsv") else ","
+        rows = list(_csv.reader(io.StringIO(text), delimiter=delim))
+        rows = [r for r in rows if any((c or "").strip() for c in r)]
+        if not rows:
+            raise CapabilityUnavailable("this file has no readable rows")
+        out = _row_segments(rows[0], rows[1:], "file", filename)
+        if not out:
+            raise CapabilityUnavailable("this file has no readable rows")
+        return out
+
+
+class HtmlAdapter(Adapter):
+    def decompose(self, data, filename):
+        text = data.decode("utf-8", "replace") if isinstance(data, bytes) else str(data)
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(text, "lxml")
+            for tag in soup(["script", "style", "nav", "footer"]):
+                tag.decompose()
+            text = soup.get_text("\n")
+        except ImportError:
+            text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+", " ", text)).strip()
+        if not text:
+            raise CapabilityUnavailable("no readable text in this page")
+        return TranscriptAdapter().decompose(text.encode("utf-8"), filename)
 
 
 class VideoAdapter(Adapter):
@@ -119,8 +284,9 @@ def _narration_for(transcript, t0, t1):
 
 
 _REGISTRY = {
-    "pdf": PdfAdapter(), "image": ImageAdapter(), "transcript": TranscriptAdapter(),
-    "video": VideoAdapter(), "audio": AudioAdapter(),
+    "pdf": PdfAdapter(), "docx": DocxAdapter(), "sheet": SheetAdapter(),
+    "csv": CsvAdapter(), "html": HtmlAdapter(), "image": ImageAdapter(),
+    "transcript": TranscriptAdapter(), "video": VideoAdapter(), "audio": AudioAdapter(),
 }
 
 

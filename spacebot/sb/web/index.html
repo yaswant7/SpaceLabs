@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Spacebot · SpaceLabs</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+<script>
+  /* Set the theme before first paint so a light-mode user never sees a dark flash. */
+  (function () {
+    var t = localStorage.getItem('sb-theme');
+    if (!t) t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
+</head>
+<body>
+<noscript style="display:block;padding:40px;text-align:center">
+  Spacebot needs JavaScript enabled.
+</noscript>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
