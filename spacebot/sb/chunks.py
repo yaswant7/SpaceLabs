@@ -40,6 +40,12 @@ CREATE TABLE IF NOT EXISTS chunks (
     vector BLOB,               -- float32, L2-normalised; NULL until embedded
     model TEXT,                -- which embedder produced `vector`
     meta TEXT DEFAULT '{}',
+    -- The rest of the chain: source → segment → chunk. Without these a citation can name
+    -- the document but not the place in it, which is the difference between "from the CV"
+    -- and "page 2, paragraph 14".
+    source_id TEXT,            -- the uploaded file this text came from
+    segment_id TEXT,           -- the parsed unit within it (page, paragraph, row, scene)
+    anchor TEXT DEFAULT '{}',  -- {page:N} | {para:N} | {sheet,row} | {t_start,t_end}
     created_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_chunk_wf ON chunks(workflow_id);
@@ -167,16 +173,52 @@ def package_to_chunks(pkg: dict) -> list:
         out.append({"source": f"faq-{i}", "heading": f.get("question", "FAQ")[:80],
                     "text": text})
 
-    # The source document, split. This is what makes an uploaded file genuinely
-    # searchable rather than only its model-written summary.
+    # The source document. This is what makes an uploaded file genuinely searchable rather
+    # than only its model-written summary.
+    #
+    # Split on the document's OWN boundaries when the adapters recovered them — a heading
+    # starts a new chunk, a table row is a chunk, an HTML section is a chunk — and fall back
+    # to character-count splitting only for material that arrived as undifferentiated prose.
+    # Chunking a table on character count cuts rows in half; chunking it on rows means a
+    # question about one row retrieves that row.
     for a in pkg.get("extra_assets") or []:
-        body = (a.get("text") or "").strip()
-        if not body:
-            continue
         fname = a.get("filename") or "document"
-        for j, piece in enumerate(split_text(body), 1):
-            out.append({"source": f"document:{fname}#{j}", "heading": fname,
-                        "text": f"{name} — {fname}\n{piece}"})
+        structure = a.get("structure")
+
+        if structure:
+            j = 0
+            for seg in structure:
+                body = (seg.get("text") or "").strip()
+                if not body:
+                    continue
+                # Anything the ingest pipeline flagged as holding a credential stays out of
+                # the index entirely. It was detected and then ignored: the flag was written
+                # onto the segment and dropped at chunking, so screenshots of tokens were
+                # being embedded and served like any other content.
+                if seg.get("secret"):
+                    continue
+                kind = seg.get("kind") or "prose"
+                # A table row is already the right size; only prose needs splitting.
+                pieces = [body] if kind in ("table", "table_row", "sheet") else split_text(body)
+                for piece in pieces:
+                    j += 1
+                    out.append({"source": f"document:{fname}#{j}", "heading": fname,
+                                "text": f"{name} — {fname}\n{piece}",
+                                "meta": {"kind": kind, "file": fname},
+                                # Splitting one segment into several pieces keeps them all
+                                # pointing at that segment: the anchor is the segment's
+                                # location, and every piece genuinely came from there.
+                                "source_id": a.get("source_id") or "",
+                                "segment_id": seg.get("segment_id") or "",
+                                "anchor": seg.get("anchor") or {}})
+        else:
+            body = (a.get("text") or "").strip()
+            if not body:
+                continue
+            for j, piece in enumerate(split_text(body), 1):
+                out.append({"source": f"document:{fname}#{j}", "heading": fname,
+                            "text": f"{name} — {fname}\n{piece}",
+                            "meta": {"kind": "prose", "file": fname}})
 
     for i, c in enumerate(out):
         c.update({"wf_key": key, "ordinal": i, "workflow_id": pkg["id"]})
@@ -197,9 +239,13 @@ def reindex_workflow(workflow_id: str, pkg: dict = None) -> int:
     now = time.time()
     conn.executemany(
         "INSERT INTO chunks(id,workflow_id,wf_key,source,ordinal,heading,text,tokens,"
-        "vector,model,meta,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        "vector,model,meta,source_id,segment_id,anchor,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [(_id(), workflow_id, c["wf_key"], c["source"], c["ordinal"], c["heading"],
-          c["text"], len(c["text"]) // 4, None, None, "{}", now) for c in rows])
+          c["text"], len(c["text"]) // 4, None, None,
+          json.dumps(c.get("meta") or {}), c.get("source_id") or "",
+          c.get("segment_id") or "", json.dumps(c.get("anchor") or {}), now)
+         for c in rows])
     conn.commit()
     conn.close()
     return len(rows)
@@ -314,10 +360,19 @@ def get_many(chunk_ids: list) -> dict:
     conn = db.connect()
     q = ",".join("?" * len(chunk_ids))
     rows = conn.execute(
-        f"SELECT id,workflow_id,wf_key,source,ordinal,heading,text FROM chunks "
-        f"WHERE id IN ({q})", chunk_ids).fetchall()
+        f"SELECT id,workflow_id,wf_key,source,ordinal,heading,text,meta,"
+        f"source_id,segment_id,anchor FROM chunks WHERE id IN ({q})", chunk_ids).fetchall()
     conn.close()
-    return {r["id"]: dict(r) for r in rows}
+    out = {}
+    for r in rows:
+        d = dict(r)
+        for field in ("meta", "anchor"):
+            try:
+                d[field] = json.loads(d.get(field) or "{}")
+            except (ValueError, TypeError):
+                d[field] = {}
+        out[r["id"]] = d
+    return out
 
 
 def steps_for(wf_key: str) -> list:

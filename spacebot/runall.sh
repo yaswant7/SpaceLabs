@@ -8,7 +8,7 @@
 # before believing it — but twice in a row is real.
 cd "$(dirname "$0")"
 status=0
-for t in test_portable test_subjects test_subjects_nonvacuous test_subject_persistence \
+for t in test_portable test_postprocess test_traceability test_answerable test_structure test_subjects test_subjects_nonvacuous test_subject_persistence \
          test_roles_audit test_titles test_thin_match test_sreedhar test_abstain \
          test_cross_person \
          test_no_leak \

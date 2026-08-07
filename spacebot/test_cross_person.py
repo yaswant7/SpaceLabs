@@ -83,6 +83,20 @@ for q in QUESTIONS:
         if canned in low:
             problems.append("recited the policy example verbatim")
 
+    # Internal vocabulary reaching the reader. The system prompt bans these words; a note
+    # written *using* them taught the model to say them back ("The excerpts do not…").
+    for internal in ["the excerpts", "the context", "these notes", "knowledge base"]:
+        if internal in low:
+            problems.append(f"exposed internal wording: {internal!r}")
+
+    # An invented negative is still an invention. "He is not known to know any programming
+    # languages" asserts something the rota cannot support — it holds week numbers, not a
+    # skills inventory — and reads as a fact about Arjun rather than a gap in our records.
+    for negative in ["is not known to", "does not know any", "has no programming",
+                     "knows no "]:
+        if negative in low:
+            problems.append(f"invented a negative: {negative!r}")
+
     if problems:
         fails.extend(f"{q!r} {p}" for p in problems)
     print(f"  {'ok  ' if not problems else 'FAIL'} {q}")

@@ -20,6 +20,7 @@ The user never sees step 3's reasoning. There is no failure message in this file
 whether we do.
 """
 import re
+import time
 
 from . import chunks as chunkstore
 from . import config, db, postprocess, prompts, retrieval
@@ -92,8 +93,50 @@ def _status_line(result, policy):
     return f"Pulling together {len(wfs)} sources…"
 
 
+def _where(anchor: dict, file: str = "") -> str:
+    """An anchor as a person would say it: "page 7", "row 12", "04:12–04:38".
+
+    The pipeline records where every piece of text came from — which page of the PDF, which
+    paragraph, which spreadsheet row, which seconds of the recording — and until now none of
+    it reached the reader. "Based on Yaswanth — CV" is a citation you have to take on trust;
+    "page 2, paragraph 14" is one you can check, which is the whole point of citing.
+    """
+    if not anchor:
+        return file or ""
+    bits = []
+    if "page" in anchor:
+        bits.append(f"page {anchor['page']}")
+    if "sheet" in anchor:
+        bits.append(f"sheet {anchor['sheet']}")
+    if "row" in anchor:
+        bits.append(f"row {anchor['row']}")
+    if "para" in anchor:
+        bits.append(f"paragraph {anchor['para']}")
+    if "table" in anchor:
+        bits.append(f"table {anchor['table']}")
+    if "image_index" in anchor:
+        bits.append(f"image {anchor['image_index']}")
+    if "t_start" in anchor:
+        def clock(s):
+            s = int(float(s))
+            return f"{s // 60}:{s % 60:02d}"
+        end = anchor.get("t_end")
+        bits.append(f"{clock(anchor['t_start'])}–{clock(end)}" if end
+                    else f"at {clock(anchor['t_start'])}")
+    located = ", ".join(bits)
+    return f"{file} · {located}" if file and located else (located or file)
+
+
 def _sources(result):
     """Provenance for the answer footer, richest workflow first."""
+    by_wf = {}
+    for c in result.get("chunks", []):
+        where = _where(c.get("anchor") or {}, (c.get("meta") or {}).get("file", ""))
+        if where:
+            by_wf.setdefault(c["wf_key"], [])
+            if where not in by_wf[c["wf_key"]]:
+                by_wf[c["wf_key"]].append(where)
+
     out = []
     for w in result["workflows"]:
         if not w["chunk_count"] and not w["related"]:
@@ -103,6 +146,9 @@ def _sources(result):
             "wf_key": w["wf_key"], "name": w["name"],
             "owner": (card or {}).get("owner", ""),
             "chunks": w["chunk_count"], "related": w["related"],
+            # Where inside the document, when we know. Several entries when an answer drew
+            # on several places in the same file — which is worth seeing.
+            "locations": by_wf.get(w["wf_key"], [])[:4],
         })
     return out
 
@@ -126,15 +172,28 @@ def _verifications(result):
 def answer_stream(question: str, profile: str = "a team member", style: str = "",
                   history: list = None, asked_by: str = ""):
     """Yields (event, payload): 'status', 'grounding', 'delta', 'meta'."""
+    started = time.time()
     prov = get_provider()
+
+    # Tell the client how long this usually takes before anything slow begins, so it can
+    # show a bar that moves instead of a line that doesn't. On a local CPU model the gap
+    # between pressing Enter and the first token is tens of seconds, and a caret blinking
+    # under "Reading …" for that long reads as a hang rather than as work.
+    eta = db.typical_answer_seconds()
+    yield ("progress", {"label": "Getting started", "pct": 3, "eta": eta})
 
     search_q = question
     if history:
-        yield ("status", "Reading the conversation…")
+        # Condensing is a full model call, so on a local CPU this stage alone can run for
+        # twenty seconds. It gets its own label or the reader watches a bar climb under
+        # "Getting started" and reasonably concludes nothing is happening.
+        yield ("progress", {"label": "Reading the conversation", "pct": 8, "eta": eta})
         try:
             search_q = prov.condense(question, history)
         except ProviderError:
             search_q = question
+
+    yield ("progress", {"label": "Searching your knowledge base", "pct": 20, "eta": eta})
 
     # Both the literal question and the rewrite are searched — see retrieval.retrieve for
     # why dropping the user's own wording is dangerous.
@@ -158,11 +217,35 @@ def answer_stream(question: str, profile: str = "a team member", style: str = ""
     # temptation, and this path already produces good answers.
     #   thin_match         every word is in the corpus, but no single document covers the
     #                      question — the match was assembled from unrelated sources.
+    # attribute_gap is deliberately NOT in this list, though it was for one revision.
+    #
+    # Routing it here stopped the invention it was aimed at, and broke something worse: the
+    # check is lexical, so "may I know Yaswanth's complete profile" and "what technologies
+    # can Yaswanth do" both look like gaps — neither word appears in his CV — and both were
+    # refused out of a document that answers them completely. Refusing a question we can
+    # answer is a worse failure than hedging one we half can, and it is the failure a user
+    # notices first.
+    #
+    # Three signals were measured for telling a synonym from a real gap, and none separates:
+    #
+    #   dense similarity, whole corpus     answer 0.655-0.833  decline 0.513-0.741
+    #   dense similarity, retained chunks  answer 0.544-0.777  decline 0.479-0.742
+    #   summary + trigger phrases          covers neither "profile" nor "technologies"
+    #
+    # A CV is semantically close to a salary question while containing no salary, which is
+    # why the dense ranges refuse to come apart. Without a signal that separates them, a
+    # threshold here would be a guess, so the gap stays a `partial` answer: say what we do
+    # hold, name what is missing, invent nothing.
     if (result.get("unsupported_terms") or result.get("unknown_subjects")
             or result.get("subject_miss") or result.get("thin_match")):
         policy = "nothing"
 
-    yield ("status", _status_line(result, policy))
+    # Retrieval is done; everything after this is the model writing. That is the great
+    # majority of the wait, so the bar hands the rest of its range to it. The label names
+    # what is being read, which is more reassuring than a stage name — it shows the system
+    # found something.
+    yield ("progress", {"label": _status_line(result, policy).rstrip("…"),
+                        "pct": 32, "eta": eta})
     yield ("grounding", {"verifications": _verifications(result)})
 
     near_wf = None
@@ -246,18 +329,39 @@ def answer_stream(question: str, profile: str = "a team member", style: str = ""
                          f"sentence, using that name exactly)")
         context = "\n".join(lines)
 
-    # Name the absence. When we hold the right subject but nothing about what was asked,
-    # a general instruction not to invent is not enough — under "NEVER SUPPLY THE MISSING
-    # PART" the model still answered "Arjun knows Python and Java" from a rota listing no
-    # languages at all. Telling it precisely which words the excerpts do not contain gives
-    # it something concrete to refuse instead of a rule to generalise from.
+    # Naming the absent words is what keeps this honest. Measured over three rounds on "what
+    # programming languages does Arjun know", against a rota holding week numbers and names:
+    #
+    #     no note at all                    invents every time
+    #     abstract note ("nothing on file") invented 2 of 2
+    #     concrete note (the words listed)  invented 1 of 3
+    #
+    # One in three is the residual, and it is the model's ceiling rather than the pipeline's:
+    # handed material about the right person and a question that material cannot answer, a
+    # 3B produces something question-shaped. Removing the material entirely does fix it, and
+    # costs more than it saves — see the note on attribute_gap above. A larger model is the
+    # real remedy; this note is the mitigation that works without one.
     gap = result.get("attribute_gap") or []
     gap_note = ""
     if gap and policy != "nothing":
+        # Concrete and almost clinical, on purpose. Softening this to "Nothing on file
+        # mentions: programming, languages" — to avoid handing the model vocabulary the
+        # system prompt bans — measurably weakened it: invention went from 0 in 3 runs to 2
+        # in 2. Naming the literal words that are absent from the literal text is what the
+        # model can act on; an abstract statement about what we hold is not.
+        #
+        # The banned vocabulary is dealt with where it belongs, in postprocess.strip_internal,
+        # which rewrites it deterministically on the way out. Strong instruction to the
+        # model, clean wording to the reader — rather than one compromise serving neither.
         gap_note = ("\n\nThe excerpts do not use the words: " + ", ".join(gap) +
-                    ". Invent no value for that — no guess, no example, no placeholder. "
-                    "Still say clearly what the excerpts DO record about this subject, in "
-                    "your own words, and then that this particular part isn't on file.")
+                    ". State no value for any of them — no guess, no example, no "
+                    "placeholder, and no claim about what is or is not true of them. Say "
+                    "what the excerpts DO record about this subject, then that this "
+                    "particular part isn't on file.")
+
+    # The last label before the long silence. Everything from here to the first token is
+    # the model reading the prompt, which is most of the wait and produces no output.
+    yield ("progress", {"label": "Writing the answer", "pct": 45, "eta": eta})
 
     full = ""
     try:
@@ -328,8 +432,14 @@ def answer_stream(question: str, profile: str = "a team member", style: str = ""
         meta["alternatives"] = [{"wf_key": s["wf_key"], "name": s["name"]}
                                 for s in sources[1:3]]
 
+    # Wall-clock for the whole answer. The one number that tells an operator whether this is
+    # usable on their hardware — a knowledge base nobody waits for is a knowledge base
+    # nobody uses — and it costs a subtraction.
+    elapsed = round(time.time() - started, 2)
+    meta["elapsed"] = elapsed
     db.log_ask(question, {"policy": policy, "evidence": evidence},
-               [s["wf_key"] for s in sources], {"streamed": True, "headline": full[:120]},
+               [s["wf_key"] for s in sources],
+               {"streamed": True, "headline": full[:120], "elapsed": elapsed},
                evidence, policy == "nothing", prov.name, asked_by=asked_by)
     yield ("meta", meta)
 

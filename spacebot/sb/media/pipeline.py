@@ -87,8 +87,12 @@ def _run(job_id, wf_key, name, category, owner, files, actor=""):
                 secrets_found += 1
             d["_image_key"] = img_key
             d["meta"] = meta
-            db.add_segment(d["_source_id"], job_id, None, d["modality"], d["_order"],
-                           d.get("text", ""), img_key, d.get("anchor"), meta)
+            # Keep the segment's id. It is the middle link of source → segment → chunk, and
+            # discarding it here is why a chunk could never say which page or row it came
+            # from even though the anchor was recorded three lines above.
+            d["_segment_id"] = db.add_segment(
+                d["_source_id"], job_id, None, d["modality"], d["_order"],
+                d.get("text", ""), img_key, d.get("anchor"), meta)
 
         if not descs:
             db.update_job(job_id, status="failed",
@@ -136,14 +140,36 @@ def _run(job_id, wf_key, name, category, owner, files, actor=""):
         # so anything the structurer didn't think to turn into a step or an FAQ becomes
         # unanswerable and unsearchable — which is not what "I uploaded this document"
         # should mean. Retrieval indexes it and the composer can quote from it.
+        # Segments are kept as segments, not welded into one blob.
+        #
+        # The adapters work hard to recover structure — a DOCX heading stays a heading, a
+        # table becomes one row per segment, an HTML nav bar is dropped — and joining
+        # everything with "\n\n" threw all of it away one line before it was needed.
+        # `package_to_chunks` then split a concatenated string on character count, so a
+        # table row could be cut in half and nothing downstream knew a table was involved.
+        #
+        # The joined text is still stored, because that is what a person reads when they
+        # open the source. The structure rides alongside it in source_ref, and chunking
+        # uses that when it is there.
         by_source = {}
         for d in descs:
             if (d.get("text") or "").strip():
-                by_source.setdefault(d["_source_id"], []).append(d["text"].strip())
-        for src_id, chunks in by_source.items():
+                by_source.setdefault(d["_source_id"], []).append(d)
+        for src_id, segs in by_source.items():
+            structured = [{
+                "text": (d.get("text") or "").strip(),
+                "kind": (d.get("meta") or {}).get("kind", ""),
+                "secret": bool((d.get("meta") or {}).get("contains_secret")),
+                # The two fields that make an answer traceable to a place in a file rather
+                # than just to the file: which segment it came from, and where that segment
+                # sits — {page: 7}, {para: 14}, {sheet, row}, {t_start, t_end}.
+                "segment_id": d.get("_segment_id", ""),
+                "anchor": d.get("anchor") or {},
+            } for d in segs]
             db.add_asset(wid, "text", source_names.get(src_id, "source"),
-                         "\n\n".join(chunks),
-                         {"origin": "extracted", "segments": len(chunks)})
+                         "\n\n".join(s["text"] for s in structured),
+                         {"origin": "extracted", "segments": len(structured),
+                          "source_id": src_id, "structure": structured})
 
         # attach the ordered visuals to steps (i-th image segment -> step i)
         image_segs = [d for d in descs if d.get("_image_key")]

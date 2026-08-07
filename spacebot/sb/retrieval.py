@@ -513,6 +513,27 @@ def _best_coverage(query: str, picked: list) -> float:
     return round(best, 3)
 
 
+# Words that ask for the document itself rather than for a fact inside it.
+#
+# "May I know the complete profile of Yaswanth" leaves `complete` and `profile` once his
+# name is removed, neither appears anywhere in his CV, and the attribute check therefore
+# read a CV as failing to answer a request for a CV — capping the score, hedging the reply
+# and stamping it "low confidence". Meanwhile "anything about Yaswanth" answered in full,
+# because "anything" happens to be a stopword. The difference was which filler the person
+# typed, which is not a difference at all.
+#
+# These are the words people reach for when they want the whole picture. If nothing but
+# these is left, the question IS "tell me about this subject", and the document we hold
+# about that subject answers it by definition.
+_BROAD_ASK = {
+    "profile", "overview", "summary", "summarise", "summarize", "detail", "details",
+    "info", "information", "background", "bio", "biography", "introduction", "intro",
+    "complete", "full", "entire", "whole", "general", "brief", "everything", "anything",
+    "something", "stuff", "about", "regarding", "concerning", "history", "record",
+    "records", "profile's", "description", "describe", "elaborate", "explain",
+}
+
+
 def _attribute_miss(query: str, picked: list, q_subjects: set) -> list:
     """Right person, wrong question: we hold material about them, but not about this.
 
@@ -539,7 +560,8 @@ def _attribute_miss(query: str, picked: list, q_subjects: set) -> list:
     """
     if not picked or not q_subjects:
         return []
-    rest = [t for t in dict.fromkeys(tokens(query)) if t not in q_subjects]
+    rest = [t for t in dict.fromkeys(tokens(query))
+            if t not in q_subjects and t not in _BROAD_ASK]
     if not rest:
         return []           # they asked only the name — that IS answerable from the file
     seen = {_stem(t) for t in tokens(" ".join(c["text"] for c in picked))}
@@ -620,7 +642,12 @@ def context_for_prompt(result: dict, budget: int = 9000) -> str:
             body = c["text"].strip()
             if used + len(body) > budget:
                 break
-            parts.append(f"[{c['source']}] {body}")
+            # Say when an excerpt is a table row. Pipe-separated cells read as prose to a
+            # model, which then narrates them as a sentence and loses which value belonged
+            # to which column. Naming the shape costs four words and stops that.
+            kind = (c.get("meta") or {}).get("kind", "")
+            label = " (one row from a table)" if kind in ("table", "table_row", "sheet") else ""
+            parts.append(f"[{c['source']}{label}] {body}")
             used += len(body)
         parts.append("")
     return "\n".join(parts).strip()

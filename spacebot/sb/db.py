@@ -238,6 +238,9 @@ _ADDED_COLUMNS = [
     ("workflows", "updated_by", "TEXT DEFAULT ''"),
     ("workflows", "updated_at", "REAL"),
     ("ask_log", "asked_by", "TEXT DEFAULT ''"),
+    ("chunks", "source_id", "TEXT"),
+    ("chunks", "segment_id", "TEXT"),
+    ("chunks", "anchor", "TEXT DEFAULT '{}'"),
 ]
 
 
@@ -447,7 +450,9 @@ def get_package(workflow_id: str) -> dict:
         "trigger_phrases": json.loads(w["trigger_phrases"] or "[]"),
         "subjects": json.loads((w["subjects"] if "subjects" in w.keys() else "") or "[]"),
         "steps": [step_dict(s) for s in steps],
-        "extra_assets": [{"kind": a["kind"], "filename": a["filename"], "text": a["text"]}
+        "extra_assets": [{"kind": a["kind"], "filename": a["filename"], "text": a["text"],
+                          "structure": json.loads(a["source_ref"] or "{}").get("structure"),
+                          "source_id": json.loads(a["source_ref"] or "{}").get("source_id")}
                          for a in assets.values() if a["id"] not in {s["asset_id"] for s in steps}],
         "known_errors": [{"code": e["code"], "cause": e["cause"], "resolution": e["resolution"]} for e in kes],
         "faqs": [{"question": f["question"], "answer": f["answer"]} for f in faqs],
@@ -478,6 +483,45 @@ def log_ask(question, route, workflow_ids, answer, confidence, abstained, provid
          confidence, 1 if abstained else 0, provider, time.time(), asked_by or ""))
     conn.commit()
     conn.close()
+
+
+_eta_cache = {"at": 0.0, "value": None}
+
+
+def typical_answer_seconds(default: float = 45.0) -> float:
+    """How long an answer usually takes on THIS machine, from what actually happened.
+
+    Used to drive the progress bar. A hardcoded guess would be wrong on every machine but
+    the one it was written on — a laptop on a 3B and a server on a 7B differ by minutes —
+    whereas the median of recent answers is right by construction and adapts as the corpus
+    or the model changes.
+
+    Median rather than mean: one cold start where the model had to load from disk should not
+    stretch every subsequent estimate.
+
+    Cached for a minute. This is read on every question and its answer moves slowly.
+    """
+    now = time.time()
+    if _eta_cache["value"] is not None and now - _eta_cache["at"] < 60:
+        return _eta_cache["value"]
+
+    times = []
+    try:
+        conn = connect()
+        rows = conn.execute(
+            "SELECT answer FROM ask_log ORDER BY created_at DESC LIMIT 40").fetchall()
+        conn.close()
+        for r in rows:
+            v = (json.loads(r["answer"] or "{}") or {}).get("elapsed")
+            if isinstance(v, (int, float)) and 0 < v < 900:
+                times.append(v)
+    except (sqlite3.Error, ValueError, TypeError):
+        pass
+
+    times.sort()
+    value = times[len(times) // 2] if times else default
+    _eta_cache.update({"at": now, "value": value})
+    return value
 
 
 def update_workflow_meta(wf_key: str, fields: dict, actor: str = "") -> bool:
@@ -621,12 +665,27 @@ def admin_overview(days: int = 30) -> dict:
     recent_q = [dict(r) for r in conn.execute(
         "SELECT question,asked_by,abstained,confidence,created_at FROM ask_log "
         "ORDER BY created_at DESC LIMIT 12").fetchall()]
+
+    # Median, not mean: one cold-start answer that took four minutes should not become the
+    # number an operator reads as "typical".
+    times = []
+    for r in conn.execute("SELECT answer FROM ask_log WHERE created_at >= ?",
+                          (since,)).fetchall():
+        try:
+            v = (json.loads(r["answer"] or "{}") or {}).get("elapsed")
+        except (ValueError, TypeError):
+            v = None
+        if isinstance(v, (int, float)):
+            times.append(v)
+    times.sort()
+    median_s = times[len(times) // 2] if times else None
     conn.close()
 
     total_asks = asks["total"] or 0
     abstained = asks["abstained"] or 0
     return {
         "days": days,
+        "median_seconds": median_s,
         "workflows": wf["total"] or 0,
         "published": wf["published"] or 0,
         "people": people,

@@ -471,8 +471,44 @@ async function send(question, { style = '', regenerate = false } = {}) {
 
   const body = addBotTurn();
   const mdBox = el('div', 'md');
-  const statusBox = el('div', 'status', '<span class="status__dot"></span><span>Thinking…</span>');
+  const statusBox = el('div', 'thinking', `
+    <div class="thinking__head">
+      <span class="thinking__pulse"></span>
+      <span class="thinking__label">Getting started</span>
+      <span class="thinking__time"></span>
+    </div>
+    <div class="thinking__track"><i></i></div>
+    <div class="thinking__skeleton"><span></span><span></span><span></span></div>`);
   body.appendChild(statusBox);
+
+  /* A bar driven by how long answers actually take on this machine, not by a guess.
+     It creeps toward 95% and stops there: the last 5% belongs to the answer arriving, and a
+     bar sitting at 100% with nothing on screen is worse than no bar at all. */
+  let etaSeconds = 45, floorPct = 0, progressTimer = 0;
+  const barFill = $('i', $('.thinking__track', statusBox));
+  const labelEl = $('.thinking__label', statusBox);
+  const timeEl = $('.thinking__time', statusBox);
+  const startedAt = Date.now();
+
+  const paintProgress = () => {
+    if (!statusBox.isConnected) return;
+    const elapsed = (Date.now() - startedAt) / 1000;
+    // Ease out toward the estimate, so overrunning slows the bar rather than stalling it.
+    const share = 1 - Math.exp(-1.6 * (elapsed / Math.max(etaSeconds, 1)));
+    const pct = Math.min(95, Math.max(floorPct, Math.round(share * 95)));
+    barFill.style.width = pct + '%';
+
+    /* Time remaining, never a bare percentage. "82%" tells you the bar's position, which
+       you can already see; "about 20s left" tells you whether to wait or go and do
+       something else, which is the only question being asked. Past the estimate it says so
+       honestly rather than counting into negative numbers. */
+    const left = Math.round(etaSeconds - elapsed);
+    timeEl.textContent = left > 3 ? `about ${left}s left`
+      : left > -20 ? 'almost there' : 'taking longer than usual';
+  };
+  progressTimer = setInterval(paintProgress, 250);
+  paintProgress();
+  const stopProgress = () => { clearInterval(progressTimer); progressTimer = 0; };
   body.setAttribute('aria-live', 'polite');
   body.setAttribute('aria-busy', 'true');
 
@@ -509,11 +545,18 @@ async function send(question, { style = '', regenerate = false } = {}) {
         buf = buf.slice(idx + 2);
         if (!ev) continue;
         if (ev.event === 'delta') {
-          if (statusBox.isConnected) statusBox.replaceWith(mdBox);
+          /* Words are better progress than any bar, so the moment one arrives the
+             indicator is replaced by the answer itself. */
+          if (statusBox.isConnected) { stopProgress(); statusBox.replaceWith(mdBox); }
           text += ev.data;
           schedule();
         } else if (ev.event === 'status') {
-          if (statusBox.isConnected) $('span:last-child', statusBox).textContent = ev.data;
+          if (statusBox.isConnected) labelEl.textContent = String(ev.data).replace(/…$/, '');
+        } else if (ev.event === 'progress') {
+          if (ev.data.eta) etaSeconds = ev.data.eta;
+          if (ev.data.pct) floorPct = Math.max(floorPct, ev.data.pct);
+          if (ev.data.label && statusBox.isConnected) labelEl.textContent = ev.data.label;
+          paintProgress();
         } else if (ev.event === 'grounding') {
           setVerifications(ev.data.verifications);
         } else if (ev.event === 'meta') {
@@ -534,6 +577,7 @@ async function send(question, { style = '', regenerate = false } = {}) {
     }
     done = true;
     if (raf) cancelAnimationFrame(raf);
+    stopProgress();
     if (statusBox.isConnected) statusBox.replaceWith(mdBox);
     mdBox.innerHTML = md(text);
     body.insertAdjacentHTML('beforeend', metaHtml(meta));
@@ -596,6 +640,12 @@ function metaHtml(m) {
   const verified = w.verified_by
     ? ` · verified by <b>@${esc(w.verified_by)}</b>${w.verified_at ? ' on ' + esc(w.verified_at) : ''}`
     : '';
+  /* Where inside the document, when the pipeline recorded it — "page 2, paragraph 14".
+     A citation you can check beats one you have to trust. */
+  const locs = ((m.sources || []).find(s => s.wf_key === w.wf_key) || {}).locations || [];
+  const where = locs.length
+    ? ` <span class="where">· ${esc(locs.slice(0, 2).join(' · '))}</span>` : '';
+
   const chip = t => `<button class="chip" data-ask="${esc(t)}">${esc(t)}</button>`;
   const alts = (m.alternatives || [])
     .map(a => `<button class="chip" data-ask="How do I ${esc((a.name || '').toLowerCase())}?">${esc(a.name)} →</button>`)
@@ -605,7 +655,7 @@ function metaHtml(m) {
   return `<div class="srcbar">
     <div class="srccard">
       <span class="badge badge--${esc(m.band || 'medium')}">${esc(m.band || 'medium')} confidence</span>
-      <span>Based on <b>${esc(w.name || 'a workflow')}</b>${verified}</span>
+      <span>Based on <b>${esc(w.name || 'a workflow')}</b>${where}${verified}</span>
       <button class="disclose" data-act="details">Details</button>
     </div>
     <div class="details" hidden>
@@ -993,6 +1043,8 @@ async function overviewTab() {
       ${stat(o.answer_rate === null ? '—' : o.answer_rate + '%', 'answered',
              `${o.abstained} had nothing on file`)}
       ${stat(o.gaps_open, 'open gaps', 'worth writing up')}
+      ${stat(o.median_seconds == null ? '—' : o.median_seconds + 's', 'typical answer',
+             'median, end to end')}
     </div>
 
     <div class="card">

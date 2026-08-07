@@ -625,3 +625,57 @@ select { appearance: none; cursor: pointer;
   .bar { grid-template-columns: 1fr max-content; }
   .bar__track { grid-column: 1 / -1; }
 }
+
+/* Where inside a document an answer came from — page, row, timestamp. */
+.where { color: var(--text-faint); }
+
+
+/* ---- waiting for an answer -------------------------------------------- */
+/* A local model on CPU can take a minute before its first word. That silence is the worst
+   moment in the product, so it gets a real component rather than a spinner: what is
+   happening now, how far along, and how long is left — the three things someone actually
+   wants to know before deciding whether to wait. */
+.thinking { display: flex; flex-direction: column; gap: 10px; padding: 2px 0 4px;
+  max-width: 460px; }
+.thinking__head { display: flex; align-items: center; gap: 9px; font-size: 14px;
+  color: var(--text-mut); }
+.thinking__label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: var(--text); font-weight: 500; }
+.thinking__time { flex: none; font-size: 12.2px; color: var(--text-faint);
+  font-variant-numeric: tabular-nums; }
+
+/* A soft pulse rather than a spinner: a spinner at this size reads as "loading a page",
+   and this is a person thinking, not a network request. */
+.thinking__pulse { width: 8px; height: 8px; border-radius: 50%; flex: none;
+  background: var(--accent); animation: think-pulse 1.5s var(--ease) infinite; }
+@keyframes think-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 0 0 var(--accent-soft); }
+  50%      { opacity: .55; transform: scale(.86); box-shadow: 0 0 0 6px transparent; }
+}
+
+.thinking__track { height: 5px; border-radius: 99px; background: var(--surface-3);
+  overflow: hidden; }
+.thinking__track i { display: block; height: 100%; width: 0; border-radius: 99px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width .35s var(--ease); position: relative; }
+/* A sheen travelling along the filled part, so the bar still looks alive during the long
+   stretch where the percentage barely moves. */
+.thinking__track i::after { content: ""; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.35), transparent);
+  animation: think-sheen 1.6s linear infinite; }
+@keyframes think-sheen { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+
+/* Ghost of the answer to come. Gives the empty space a shape, so the reply appears to
+   arrive into a place that was waiting for it rather than shoving the page around. */
+.thinking__skeleton { display: flex; flex-direction: column; gap: 7px; margin-top: 2px; }
+.thinking__skeleton span { height: 9px; border-radius: 5px; background: var(--surface-3);
+  animation: think-fade 1.8s var(--ease) infinite; }
+.thinking__skeleton span:nth-child(1) { width: 92%; }
+.thinking__skeleton span:nth-child(2) { width: 78%; animation-delay: .18s; }
+.thinking__skeleton span:nth-child(3) { width: 54%; animation-delay: .36s; }
+@keyframes think-fade { 0%, 100% { opacity: .45; } 50% { opacity: .9; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .thinking__pulse, .thinking__track i::after, .thinking__skeleton span { animation: none; }
+}
+@media (max-width: 620px) { .thinking { max-width: none; } }
