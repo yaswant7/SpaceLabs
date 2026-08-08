@@ -481,6 +481,43 @@ def _unsupported_terms(query: str, picked: list) -> list:
     return missing if len(missing) == len(q) else []
 
 
+# Words that tell us HOW to answer, not WHAT to find.
+#
+# "Can you elaborate more about Yaswanth in 400 characters" was refused, because `400` and
+# `characters` appear in no document and dragged query coverage from 0.50 to 0.25 — under
+# the threshold that exists to catch questions nothing covers. The same question without the
+# length limit answered perfectly. A person adding "briefly" or "in two lines" is shaping
+# the reply, and scoring those words as though they were subject matter punishes them for
+# saying how they would like to be answered.
+_DIRECTIVE = {
+    "character", "characters", "word", "words", "line", "lines", "sentence", "sentences",
+    "paragraph", "paragraphs", "bullet", "bullets", "briefly", "brief", "concise",
+    "concisely", "short", "shortly", "lengthy", "max", "maximum", "minimum", "limit",
+    "under", "within", "less", "least", "point", "points", "format", "bulletpoints",
+}
+
+
+def query_terms(query: str) -> list:
+    """The parts of a question that are actually about the subject matter.
+
+    Digits are dropped only when a directive word is present, so "in 400 characters" loses
+    its 400 while "who is on call in week 32" keeps its 32 — the number there IS the
+    question.
+    """
+    toks = tokens(query)
+    has_directive = any(t in _DIRECTIVE for t in toks)
+    out = []
+    for t in toks:
+        if t in _DIRECTIVE:
+            continue
+        if has_directive and t.isdigit():
+            continue
+        out.append(t)
+    # Never strip a question down to nothing; if it was all directives, judge on the
+    # original rather than on an empty list.
+    return out or toks
+
+
 def _best_coverage(query: str, picked: list) -> float:
     """How much of the question the single best-covering document accounts for.
 
@@ -500,7 +537,7 @@ def _best_coverage(query: str, picked: list) -> float:
     scores high here; a question answered only by stitching fragments from unrelated
     sources scores low, however well its individual words match.
     """
-    terms = {_stem(t) for t in tokens(query)}
+    terms = {_stem(t) for t in query_terms(query)}
     if not terms or not picked:
         return 0.0
     by_wf = {}
@@ -534,6 +571,53 @@ _BROAD_ASK = {
 }
 
 
+def _is_broad_ask(term: str) -> bool:
+    """Is this one of the "tell me the whole picture" words, typos included?
+
+    People type questions fast. "Can you eloborate more about Yaswanth" is plainly a request
+    for the whole picture, and matching the list exactly meant one transposed letter turned
+    it into a request for a specific attribute called "eloborate" — which nothing contains,
+    so the answer came back hedged for no reason the reader could see.
+
+    One edit of tolerance, and only for words long enough that a single edit cannot reach a
+    different real word.
+    """
+    if term in _BROAD_ASK:
+        return True
+    if len(term) < 6:
+        return False
+    for word in _BROAD_ASK:
+        if abs(len(word) - len(term)) > 1 or len(word) < 6:
+            continue
+        if _within_one_edit(term, word):
+            return True
+    return False
+
+
+def _within_one_edit(a: str, b: str) -> bool:
+    """True if `a` becomes `b` with at most one insert, delete or substitution."""
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    if la == lb:                                   # one substitution
+        return sum(x != y for x, y in zip(a, b)) == 1
+    short, long = (a, b) if la < lb else (b, a)    # one insertion
+    i = j = 0
+    skipped = False
+    while i < len(short) and j < len(long):
+        if short[i] == long[j]:
+            i += 1
+            j += 1
+        elif skipped:
+            return False
+        else:
+            skipped = True
+            j += 1
+    return True
+
+
 def _attribute_miss(query: str, picked: list, q_subjects: set) -> list:
     """Right person, wrong question: we hold material about them, but not about this.
 
@@ -560,8 +644,8 @@ def _attribute_miss(query: str, picked: list, q_subjects: set) -> list:
     """
     if not picked or not q_subjects:
         return []
-    rest = [t for t in dict.fromkeys(tokens(query))
-            if t not in q_subjects and t not in _BROAD_ASK]
+    rest = [t for t in dict.fromkeys(query_terms(query))
+            if t not in q_subjects and not _is_broad_ask(t)]
     if not rest:
         return []           # they asked only the name — that IS answerable from the file
     seen = {_stem(t) for t in tokens(" ".join(c["text"] for c in picked))}
